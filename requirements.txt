@@ -1,21 +1,25 @@
 termcolor==3.1.0
-fastapi>=0.115.0
+fastapi>=0.142.2,<1
 uvicorn>=0.30.0
 websockets>=12.0
-jinja2>=3.1.0
-python-multipart>=0.0.9
-Pillow>=10.4.0
+jinja2>=3.1.6,<4
+python-multipart>=0.0.32
+Pillow>=13.0.0,<14
 pip-system-certs==4.0
-requests~=2.31.0
+# selenium-recaptcha-solver 1.9.1 still requires requests<2.33.
+# Keep the newest compatible security patches; see docs/optimization-audit.md.
+requests>=2.32.5,<2.33
+urllib3>=2.8.0,<3
+certifi>=2026.10.19
 chardet==5.2.0
 beautifulsoup4==4.11.1
 pysocks==1.7.1
-lxml==4.9.4
+lxml>=6.1.0,<7
 markupsafe~=2.1.2
 curl_cffi>=0.7.0
 opencc-python-reimplemented>=0.1.7
 yt-dlp
-selenium-recaptcha-solver~=1.9.0
+selenium-recaptcha-solver==1.9.1
 webdriver-manager
-selenium~=4.8.0
+selenium~=4.35.0
 msal

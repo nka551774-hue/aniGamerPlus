@@ -16,6 +16,10 @@ from urllib.parse import urlencode
 INDEX_API = 'https://api.gamer.com.tw/mobile_app/anime/v3/index.php'
 LIST_URL = 'https://ani.gamer.com.tw/animeList.php'
 REF_URL = 'https://ani.gamer.com.tw/animeRef.php?sn='
+# The catalogue currently spans dozens of pages. Reject implausible pagination
+# instead of turning one malformed upstream link into an unbounded crawl. The
+# caller retains its previous cache when parsing raises.
+MAX_CATALOG_PAGES = 1000
 
 # 一张卡片从这里开始, 用它切开整页比写一条跨卡片的大正则稳: 某个字段缺了
 # 只会让那一张卡片少一项, 不会让 .*? 一路吃到下一张卡片上去
@@ -68,8 +72,16 @@ def parse_list_page(html):
 
 def total_pages(html):
     """页码条上最大的那个数字. 抓不到就当只有一页, 宁可少爬也别空转."""
-    pages = [int(m) for m in _PAGE_NO.findall(html)]
-    return max(pages) if pages else 1
+    total = 1
+    for match in _PAGE_NO.finditer(html):
+        digits = match.group(1).lstrip('0') or '0'
+        if len(digits) > len(str(MAX_CATALOG_PAGES)):
+            raise ValueError('implausible catalogue page count')
+        page = int(digits)
+        if page > MAX_CATALOG_PAGES:
+            raise ValueError('implausible catalogue page count')
+        total = max(total, page)
+    return total
 
 
 def list_page_url(page, tag=''):

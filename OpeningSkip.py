@@ -221,8 +221,14 @@ def anime_skip_op(series, episode, duration, *, session=requests):
             start, end = stamp['at'], stamps[index + 1]['at']
             if 40 <= end - start <= 210 and end <= duration - 300:
                 valid.append(((start, end), len(stamps), abs(length - duration)))
-    if not valid or any(abs(a[0][0] - b[0][0]) > 3 or abs(a[0][1] - b[0][1]) > 3
-                        for a in valid for b in valid):
+    if not valid:
+        return None
+    # Comparing every pair is quadratic when a provider returns many recordings
+    # of the same episode. Each coordinate agrees within three seconds exactly
+    # when its maximum and minimum differ by at most three seconds.
+    starts = [row[0][0] for row in valid]
+    ends = [row[0][1] for row in valid]
+    if max(starts) - min(starts) > 3 or max(ends) - min(ends) > 3:
         return None
     return min(valid, key=lambda row: (-row[1], row[2]))[0]
 

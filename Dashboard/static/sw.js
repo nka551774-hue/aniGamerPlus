@@ -6,18 +6,17 @@
    --------------------------------------------------------------------------- */
 'use strict';
 
-var CACHE = 'agp-shell-v15';
+var CACHE = 'agp-shell-v16';
+var OFFLINE = './static/offline.html';
 
 /* Bare paths on purpose: the ?v= tokens in the templates move whenever an asset
    changes, and a list that pinned them would drift out of step unnoticed. These
    copies are the offline fallback; the runtime cache holds the versioned ones.
 
-   './' is the one entry no token can expire, because the HTML is what carries
-   the tokens. Bump CACHE above whenever the templates change shape -- otherwise
-   a returning visitor keeps the old markup and only its assets move on, which
-   looks like an element that renders as an empty box. */
+   Session-rendered HTML must never enter CacheStorage: it survives logout and
+   could expose the previous user's name and account state while offline. */
 var SHELL = [
-    './',
+    OFFLINE,
     './static/css/agp.css',
     './static/css/home.css',
     './static/css/catalog.css',
@@ -48,7 +47,7 @@ self.addEventListener('activate', function (event) {
     event.waitUntil(
         caches.keys().then(function (keys) {
             return Promise.all(keys.map(function (key) {
-                return key === CACHE ? null : caches.delete(key);
+                return key !== CACHE && key.indexOf('agp-shell-') === 0 ? caches.delete(key) : null;
             }));
         }).then(function () { return self.clients.claim(); })
     );
@@ -97,6 +96,19 @@ function shouldBypass(url, request) {
     return false;
 }
 
+function cached(request, options) {
+    return caches.open(CACHE).then(function (cache) { return cache.match(request, options); });
+}
+
+function cacheAsset(event, request, response, onlyIfMissing) {
+    var copy = response.clone();
+    event.waitUntil(caches.open(CACHE).then(function (cache) {
+        return (onlyIfMissing ? cache.match(request) : Promise.resolve(null)).then(function (stored) {
+            if (!stored) { return cache.put(request, copy); }
+        });
+    }).catch(function () { /* A full cache must not interrupt playback or navigation. */ }));
+}
+
 self.addEventListener('fetch', function (event) {
     var request = event.request;
     if (request.method !== 'GET') { return; }
@@ -110,13 +122,12 @@ self.addEventListener('fetch', function (event) {
     if (url.origin !== self.location.origin) { return; }
     if (shouldBypass(url, request)) { return; }
 
-    /* Navigations stay network-first: the dashboard renders per-session state
-       into the page, so a cached copy is only ever the offline fallback. */
+    /* The offline fallback contains no account data or session bootstrap. */
     if (request.mode === 'navigate') {
         event.respondWith(
             fetch(request).catch(function () {
-                return caches.match(request).then(function (hit) {
-                    return hit || caches.match('./');
+                return cached(OFFLINE).then(function (hit) {
+                    return hit || new Response('Offline', { status: 503 });
                 });
             })
         );
@@ -125,19 +136,18 @@ self.addEventListener('fetch', function (event) {
 
     if (isVersionedAsset(url)) {
         event.respondWith(
-            caches.match(request).then(function (hit) {
+            cached(request).then(function (hit) {
                 if (hit) { return hit; }
                 return fetch(request).then(function (response) {
                     if (response && response.ok && response.type === 'basic') {
-                        var copy = response.clone();
-                        caches.open(CACHE).then(function (cache) { cache.put(request, copy); });
+                        cacheAsset(event, request, response, false);
                     }
                     return response;
                 }).catch(function () {
                     /* Offline holding a token this cache has never seen: the
                        shell copy stored under the bare path is the same file,
                        and a possibly-older script beats no script at all. */
-                    return caches.match(request, { ignoreSearch: true }).then(function (fallback) {
+                    return cached(request, { ignoreSearch: true }).then(function (fallback) {
                         return fallback || Response.error();
                     });
                 });
@@ -154,19 +164,11 @@ self.addEventListener('fetch', function (event) {
         fetch(request).then(function (response) {
             if (response && response.ok && response.type === 'basic' &&
                 url.pathname.indexOf('/static/') === 0) {
-                /* The copy has to be taken before the page starts reading the
-                   body, so it is taken first and dropped again when the library
-                   is already stored -- otherwise every navigation rewrites it. */
-                var copy = response.clone();
-                caches.open(CACHE).then(function (cache) {
-                    return cache.match(request).then(function (stored) {
-                        if (!stored) { cache.put(request, copy); }
-                    });
-                });
+                cacheAsset(event, request, response, true);
             }
             return response;
         }).catch(function () {
-            return caches.match(request).then(function (hit) {
+            return cached(request).then(function (hit) {
                 return hit || Response.error();
             });
         })

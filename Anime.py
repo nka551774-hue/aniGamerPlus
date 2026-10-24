@@ -6,7 +6,9 @@
 # @Software: PyCharm
 # @Forked  : AvianJay
 import ftplib
+import errno
 import shutil
+import tempfile
 import traceback
 import Config
 from curl_cffi import requests as curl_requests
@@ -17,12 +19,67 @@ from ColorPrint import err_print
 from ftplib import FTP, FTP_TLS
 import socket
 import threading
-from urllib.parse import quote
+from urllib.parse import quote, urljoin, urlsplit
 from yt_dlp import YoutubeDL
 
 
 class TryTooManyTimeError(BaseException):
     pass
+
+
+def _publish_video(source, destination, copy_file=False):
+    """Replace a complete episode only after its replacement is ready.
+
+    A local merge is already a staging file, so a same-filesystem rename is
+    atomic and needs no extra I/O. Cross-filesystem moves and explicit copy
+    mode stage in the destination directory before that final atomic rename.
+    """
+    source_size = os.path.getsize(source)
+    if source_size == 0:
+        raise OSError('Cannot publish an empty video')
+    if not copy_file:
+        try:
+            os.replace(source, destination)
+            return
+        except OSError as error:
+            # Windows reports ERROR_NOT_SAME_DEVICE (17); POSIX uses EXDEV.
+            # Permission/full-disk failures must not turn into a destructive
+            # fallback copy over the currently published episode.
+            if error.errno != errno.EXDEV and getattr(error, 'winerror', None) != 17:
+                raise
+
+    fd, staged = tempfile.mkstemp(prefix='.' + os.path.basename(destination) + '-',
+                                  suffix='.part', dir=os.path.dirname(os.path.abspath(destination)))
+    os.close(fd)
+    try:
+        shutil.copyfile(source, staged)
+        if os.path.getsize(staged) != source_size:
+            raise OSError('Incomplete video copy')
+        with open(staged, 'rb+') as copied:
+            try:
+                os.fsync(copied.fileno())
+            except OSError as error:
+                # Some rclone/network mounts do not implement fsync. Other
+                # errors (especially delayed ENOSPC/EIO) mean the copy cannot
+                # safely replace the existing episode.
+                if error.errno not in (errno.EINVAL, errno.ENOSYS, errno.ENOTSUP):
+                    raise
+        os.replace(staged, destination)
+    except BaseException:
+        try:
+            os.unlink(staged)
+        except OSError:
+            pass
+        raise
+
+    # The old episode stays intact until replace succeeds. In particular a
+    # full disk/failed copy must leave both the source and old episode usable.
+    try:
+        os.remove(source)
+    except OSError as error:
+        # Publication succeeded; an extra temporary file must not turn it
+        # into a failed download and trigger an unnecessary full retry.
+        err_print(0, '暫存影片清理失敗', str(error), no_sn=True, status=1)
 
 
 class Anime:
@@ -298,9 +355,9 @@ class Anime:
         self.__init_header()
         self._identity_generation += 1
 
-    def __request(self, req, no_cookies=False, show_fail=True, max_retry=3, addition_header=None, verify_fingerprint=False, resend_on_reset=True):
+    def __request(self, req, no_cookies=False, show_fail=True, max_retry=3, addition_header=None, verify_fingerprint=False, resend_on_reset=True, cancel_event=None):
         # 设置 header
-        current_header = self._req_header
+        current_header = dict(self._req_header)
         if addition_header is None:
             addition_header = {}
         if len(addition_header) > 0:
@@ -314,22 +371,34 @@ class Anime:
         else:
             cookies = {}
         while True:
+            if cancel_event is not None and cancel_event.is_set():
+                raise TryTooManyTimeError('Segment download cancelled')
             try:
                 if verify_fingerprint:
                     proxies = self._proxies if self._proxies else None
                     f = self._fingerprint_session.get(req, headers=current_header, cookies=cookies, timeout=10, proxies=proxies)
                 else:
                     f = self._session.get(req, headers=current_header, cookies=cookies, timeout=10)
-            except requests.exceptions.RequestException as e:
+            except (requests.exceptions.RequestException, curl_requests.RequestsError) as e:
                 if error_cnt >= max_retry >= 0:
                     raise TryTooManyTimeError('任務狀態: sn=' + str(self._sn) + ' 请求失败次数过多！请求链接：\n%s' % req)
                 err_detail = 'ERROR: 请求失败！except：\n' + str(e) + '\n3s后重试(最多重试' + str(max_retry) + '次)'
                 if show_fail:
                     err_print(self._sn, '任務狀態', err_detail)
-                time.sleep(3)
+                if cancel_event is None:
+                    time.sleep(3)
+                elif cancel_event.wait(3):
+                    # segment_max_retry=-1 is a supported unlimited retry.
+                    # A sibling's terminal failure still has to stop it so the
+                    # owner can join every writer before another attempt.
+                    raise TryTooManyTimeError('Segment download cancelled') from e
                 error_cnt += 1
             else:
                 break
+        if cancel_event is not None and cancel_event.is_set():
+            raise TryTooManyTimeError('Segment download cancelled')
+        if no_cookies:
+            return f
         # 处理 cookie
         if not self._cookies:
             # 当实例中尚无 cookie, 则读取
@@ -396,7 +465,7 @@ class Anime:
                         err_print(self._sn, '換上新cookie重送請求', display=False)
                         self.__renew_identity()
                         return self.__request(req, no_cookies, show_fail, max_retry, addition_header,
-                                              verify_fingerprint, resend_on_reset=False)
+                                              verify_fingerprint, resend_on_reset=False, cancel_event=cancel_event)
 
                 else:
                     # 本线程收到了新cookie
@@ -421,10 +490,7 @@ class Anime:
         return f
 
     def __request_json(self, req, no_cookies=False, show_fail=True, max_retry=3, addition_header=None, verify_fingerprint=False):
-        if verify_fingerprint:
-            return self.__request(req, no_cookies, show_fail, max_retry, addition_header, verify_fingerprint).json
-        else:
-            return self.__request(req, no_cookies, show_fail, max_retry, addition_header, verify_fingerprint).json()
+        return self.__request(req, no_cookies, show_fail, max_retry, addition_header, verify_fingerprint).json()
 
     def __get_m3u8_dict(self):
         # m3u8获取模块参考自 https://github.com/c0re100/BahamutAnimeDownloader
@@ -715,43 +781,67 @@ class Anime:
         output_file = os.path.join(self._bangumi_dir, filename)  # 完整输出路径
         merging_file = os.path.join(self._temp_dir, merging_filename)
 
-        url_path = os.path.split(self._m3u8_dict[resolution])[0]  # 用于构造完整 chunk 链接
+        playlist_url = self._m3u8_dict[resolution]
         temp_dir = os.path.join(self._temp_dir, str(self._sn) + '-downloading-by-aniGamerPlusPlus')  # 临时目录以 sn 命令
         if not os.path.exists(temp_dir):  # 创建临时目录
             os.makedirs(temp_dir)
         m3u8_path = os.path.join(temp_dir, str(self._sn) + '.m3u8')  # m3u8 存放位置
-        m3u8_text = self.__request(self._m3u8_dict[resolution], no_cookies=True).text  # 请求 m3u8 文件
+        m3u8_response = self.__request(playlist_url, no_cookies=True)
+        m3u8_response.raise_for_status()
+        m3u8_text = m3u8_response.text
+        # A playlist is external input, including on ffmpeg's local-file path.
+        # Validate every segment before writing anything: searching for a safe
+        # substring can leave ../ paths or extra URI-bearing tags for ffmpeg.
+        lines = [line.strip() for line in m3u8_text.splitlines() if line.strip()]
+        key_lines = [line for line in lines if line.startswith('#EXT-X-KEY:')]
+        if not lines or lines[0] != '#EXTM3U' or len(key_lines) != 1:
+            raise ValueError('Invalid segment playlist')
+        key_line = key_lines[0]
+        key_match = re.search(r'(?:[:,])URI="([^"\r\n]+)"(?:,|$)', key_line)
+        if (not re.search(r'(?:[:,])METHOD=AES-128(?:,|$)', key_line) or not key_match
+                or len(re.findall(r'(?:[:,])\s*URI\s*=', key_line, re.I)) != 1
+                or len(re.findall(r'(?:[:,])\s*METHOD\s*=', key_line, re.I)) != 1):
+            raise ValueError('Unsupported segment encryption')
+        original_key_uri = key_match.group(1)
+        key_uri = urljoin(playlist_url, original_key_uri)
+        if urlsplit(key_uri).scheme not in ('http', 'https'):
+            raise ValueError('Invalid segment key URL')
+        if any(re.search(r'\bURI\s*=', line, re.I) and line != key_line
+               for line in lines if line.startswith('#')):
+            raise ValueError('Unsupported playlist resource')
+        chunk_list = [line for line in lines if not line.startswith('#')]
+        chunk_names = [urlsplit(chunk).path for chunk in chunk_list]
+        if not chunk_list or any(
+                not re.fullmatch(r'media_b[A-Za-z0-9_.-]+\.ts', name)
+                or urlsplit(chunk).scheme or urlsplit(chunk).netloc
+                for chunk, name in zip(chunk_list, chunk_names)):
+            raise ValueError('Invalid segment filename')
+        if len(set(chunk_names)) != len(chunk_names):
+            raise ValueError('Duplicate segment filename')
         with open(m3u8_path, 'w', encoding='utf-8') as f:  # 保存 m3u8 文件在本地
             f.write(m3u8_text)
-            pass
-        key_uri = re.search(r'(?<=AES-128,URI=")(.*)(?=")', m3u8_text).group()  # 把 key 的链接提取出来
-        original_key_uri = key_uri
-
-        if not re.match(r'http.+', key_uri):
-            # https://github.com/miyouzi/aniGamerPlus/issues/46
-            # 如果不是完整的URI
-            key_uri = url_path + '/' + key_uri  # 组成完成的 URI
 
         m3u8_key_path = os.path.join(temp_dir, 'key.m3u8key')  # key 的存放位置
+        key_response = self.__request(key_uri, no_cookies=True)
+        key_response.raise_for_status()
+        if len(key_response.content) != 16:
+            raise ValueError('Invalid AES-128 segment key')
         with open(m3u8_key_path, 'wb') as f:  # 保存 key
-            f.write(self.__request(key_uri, no_cookies=True).content)
+            f.write(key_response.content)
 
-        chunk_list = re.findall(r'media_b.+ts.*', m3u8_text)  # chunk
-
-        limiter = threading.Semaphore(self._settings['multi_downloading_segment'])  # chunk 并发下载限制器
         total_chunk_num = len(chunk_list)
         finished_chunk_counter = 0
-        failed_flag = False
+        failed = threading.Event()
+        progress_lock = threading.Lock()
+        pending_lock = threading.Lock()
+        pending_chunks = iter(zip(chunk_list, chunk_names))
 
-        def download_chunk(uri):
-            chunk_name = re.findall(r'media_b.+ts', uri)[0]  # chunk 文件名
+        def download_chunk(uri, chunk_name):
             chunk_local_path = os.path.join(temp_dir, chunk_name)  # chunk 路径
             # 邊看邊下載靠 "檔案在不在" 判斷這一片能不能播. 直接寫目標檔名的話,
             # 寫到一半的檔案也是存在的, 播放器就會拿到一段截斷的 ts. 先寫暫存檔名
             # 再 os.replace, 跟 Dashboard 產縮圖同一個寫法: 目標檔名一出現就是完整的.
             chunk_temp_path = chunk_local_path + '.part'
-            nonlocal failed_flag
-
             def drop_temp():
                 try:
                     os.remove(chunk_temp_path)
@@ -759,10 +849,13 @@ class Anime:
                     pass  # 根本沒寫成, 或已經被 replace 掉了
 
             try:
+                response = self.__request(uri, no_cookies=True, show_fail=False,
+                                          max_retry=self._settings['segment_max_retry'], cancel_event=failed)
+                response.raise_for_status()
+                if not response.content:
+                    raise ValueError('Empty segment')
                 with open(chunk_temp_path, 'wb') as f:
-                    f.write(self.__request(uri, no_cookies=True,
-                                           show_fail=False,
-                                           max_retry=self._settings['segment_max_retry']).content)
+                    f.write(response.content)
                 for attempt in range(5):
                     try:
                         os.replace(chunk_temp_path, chunk_local_path)
@@ -775,23 +868,18 @@ class Anime:
                         time.sleep(0.2)
             except TryTooManyTimeError:
                 drop_temp()
-                failed_flag = True
+                failed.set()
                 err_print(self._sn, '下載狀態', 'Bad segment=' + chunk_name, status=1)
-                limiter.release()
-                sys.exit(1)
+                return
             except BaseException as e:
                 drop_temp()
-                failed_flag = True
+                failed.set()
                 err_print(self._sn, '下載狀態', 'Bad segment=' + chunk_name + ' 發生未知錯誤: ' + str(e), status=1)
-                limiter.release()
-                sys.exit(1)
+                return
 
-            # 显示完成百分比
-            # 同一集被兩條任務同時下載時(背景追番 + 手動邊看邊下載是日常情境),
-            # 先完成的那條會 del 掉進度紀錄. 這裡整段掛 try/finally:
-            # 登記處 KeyError 不能讓分片執行緒帶著併發名額一起死 —— 否則母執行緒
-            # 卡死在 limiter.acquire(), 無 log、無錯誤、temp 留一堆半成品.
-            try:
+            # Update the counter and visible progress together so concurrent
+            # completions cannot lose increments or move progress backwards.
+            with progress_lock:
                 nonlocal finished_chunk_counter
                 finished_chunk_counter = finished_chunk_counter + 1
                 progress_rate = float(finished_chunk_counter / total_chunk_num * 100)
@@ -803,8 +891,21 @@ class Anime:
                 if self.realtime_show_file_size:
                     sys.stdout.write('\r正在下載: sn=' + str(self._sn) + ' ' + filename + ' ' + str(progress_rate) + '%  ')
                     sys.stdout.flush()
-            finally:
-                limiter.release()
+
+        def download_chunks():
+            try:
+                while not failed.is_set():
+                    with pending_lock:
+                        if failed.is_set():
+                            return
+                        try:
+                            chunk, chunk_name = next(pending_chunks)
+                        except StopIteration:
+                            return
+                    download_chunk(urljoin(playlist_url, chunk), chunk_name)
+            except BaseException as e:
+                failed.set()
+                err_print(self._sn, '下載狀態', '分片工作執行緒失敗: ' + str(e), status=1)
 
         if self.realtime_show_file_size:
             # 是否实时显示文件大小, 设计仅 cui 下载单个文件或线程数=1时适用
@@ -814,24 +915,24 @@ class Anime:
             err_print(self._sn, '正在下載', filename + ' title=' + self._title)
 
         chunk_tasks_list = []
-        for chunk in chunk_list:
-            chunk_uri = url_path + '/' + chunk
-            task = threading.Thread(target=download_chunk, args=(chunk_uri,))
-            chunk_tasks_list.append(task)
-            task.daemon = True
-            limiter.acquire()
-            task.start()
-
-        for task in chunk_tasks_list:  # 等待所有任务完成
-            while True:
-                if failed_flag:
-                    err_print(self._sn, '下載失败', filename, status=1)
-                    self.video_size = 0
-                    return
-                if task.is_alive():
-                    time.sleep(1)
-                else:
-                    break
+        worker_count = min(total_chunk_num, max(1, min(5, int(self._settings['multi_downloading_segment']))))
+        # Reuse a bounded set of workers instead of starting one OS thread per
+        # segment. Join even after failure so a retry never races old writers.
+        try:
+            for _ in range(worker_count):
+                task = threading.Thread(target=download_chunks, daemon=True)
+                task.start()
+                chunk_tasks_list.append(task)
+        except BaseException:
+            failed.set()
+            raise
+        finally:
+            for task in chunk_tasks_list:
+                task.join()
+        if failed.is_set():
+            err_print(self._sn, '下載失败', filename, status=1)
+            self.video_size = 0
+            return
 
         # 分片全部落地. 領回進度紀錄(可能被同集的另一條任務 del 掉),
         # 讓後面 ffmpeg 合併段跟 del 那行不會 KeyError.
@@ -840,11 +941,17 @@ class Anime:
 
         # m3u8 本地化
         # replace('\\', '\\\\') 为转义win路径
-        m3u8_text_local_version = m3u8_text.replace(original_key_uri, os.path.join(temp_dir, 'key.m3u8key')).replace('\\', '\\\\')
-        for chunk in chunk_list:
-            chunk_filename = re.findall(r'media_b.+ts', chunk)[0]  # chunk 文件名
-            chunk_path = os.path.join(temp_dir, chunk_filename).replace('\\', '\\\\')  # chunk 本地路径
-            m3u8_text_local_version = m3u8_text_local_version.replace(chunk, chunk_path)
+        local_chunks = dict(zip(chunk_list, chunk_names))
+        local_lines = []
+        for line in m3u8_text.splitlines():
+            stripped = line.strip()
+            if stripped in local_chunks:
+                line = os.path.join(temp_dir, local_chunks[stripped])
+            elif stripped == key_line:
+                line = key_line.replace('URI="' + original_key_uri + '"',
+                                        'URI="' + m3u8_key_path + '"')
+            local_lines.append(line.replace('\\', '\\\\'))
+        m3u8_text_local_version = '\n'.join(local_lines) + '\n'
         with open(m3u8_path, 'w', encoding='utf-8') as f:  # 保存本地化的 m3u8
             f.write(m3u8_text_local_version)
 
@@ -874,19 +981,20 @@ class Anime:
 
         # 执行 ffmpeg
         run_ffmpeg = subprocess.Popen(ffmpeg_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-        run_ffmpeg.communicate()
+        _, merge_errors = run_ffmpeg.communicate()
+        if (run_ffmpeg.returncode != 0 or b'Failed to open segment' in (merge_errors or b'')
+                or not os.path.isfile(merging_file) or os.path.getsize(merging_file) == 0):
+            # ffmpeg can leave a large partial output behind on failure. Never
+            # replace an existing good episode with it or remove the segments.
+            self.video_size = 0
+            err_print(self._sn, '下載失败', filename + ' ffmpeg_return_code=' + str(run_ffmpeg.returncode), status=1)
+            return
         # 记录文件大小，单位为 MB
         self.video_size = int(os.path.getsize(merging_file) / float(1024 * 1024))
         # 重命名
         err_print(self._sn, '下載狀態', filename + ' 解密合并完成, 本集 ' + str(self.video_size) + 'MB, 正在移至番劇目錄……')
-        if os.path.exists(output_file):
-            os.remove(output_file)
-
-        if self._settings['use_copyfile_method']:
-            shutil.copyfile(merging_file, output_file)  # 适配rclone挂载盘
-            os.remove(merging_file)  # 刪除临时合并文件
-        else:
-            shutil.move(merging_file, output_file)  # 此方法在遇到rclone挂载盘时会出错
+        _publish_video(merging_file, output_file,
+                       copy_file=self._settings['use_copyfile_method'])
 
         # 删除临时目录
         shutil.rmtree(temp_dir, ignore_errors=True)
@@ -970,17 +1078,12 @@ class Anime:
 
         if run_ffmpeg.returncode == 0 and (return_str.find('Failed to open segment') < 0):
             # 执行成功 (ffmpeg正常结束, 每个分段都成功下载)
-            if os.path.exists(output_file):
-                os.remove(output_file)
             # 记录文件大小，单位为 MB
             self.video_size = int(os.path.getsize(downloading_file) / float(1024 * 1024))
             err_print(self._sn, '下載狀態', filename + '本集 ' + str(self.video_size) + 'MB, 正在移至番劇目錄……')
 
-            if self._settings['use_copyfile_method']:
-                shutil.copyfile(downloading_file, output_file)  # 适配rclone挂载盘
-                os.remove(downloading_file)  # 刪除临时合并文件
-            else:
-                shutil.move(downloading_file, output_file)  # 此方法在遇到rclone挂载盘时会出错
+            _publish_video(downloading_file, output_file,
+                           copy_file=self._settings['use_copyfile_method'])
 
             self.local_video_path = output_file  # 记录保存路径, FTP上传用
             self._video_filename = filename  # 记录文件名, FTP上传用

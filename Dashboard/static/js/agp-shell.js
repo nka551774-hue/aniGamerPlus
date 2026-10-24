@@ -289,14 +289,20 @@
        沒去開紀錄的話, 繼續觀看永遠是空的. 現在播放頁一拿到集數表就整批寫進來,
        兩邊讀同一份. */
     var NAMES_KEY = 'agp-watch-names';
+    var namesSource = null;
+    var namesCache = {};
 
     function nameMap() {
+        var source = readStore(NAMES_KEY, '{}');
+        if (source === namesSource) { return namesCache; }
+        namesSource = source;
         try {
-            var raw = JSON.parse(readStore(NAMES_KEY, '{}'));
-            return raw && typeof raw === 'object' ? raw : {};
+            var raw = JSON.parse(source);
+            namesCache = raw && typeof raw === 'object' && !Array.isArray(raw) ? raw : {};
         } catch (error) {
-            return {};
+            namesCache = {};
         }
+        return namesCache;
     }
 
     function watchName(sn) {
@@ -306,7 +312,8 @@
 
     /* 整批寫入: 一部作品的集數表一次幾百筆, 逐筆 JSON.parse 太浪費 */
     function rememberNames(entries) {
-        var map = nameMap();
+        // Preserve the old snapshot so readers can invalidate their derived index.
+        var map = Object.assign(Object.create(null), nameMap());
         var changed = false;
         Object.keys(entries || {}).forEach(function (sn) {
             var entry = entries[sn];
@@ -510,6 +517,7 @@
         readStore: readStore,
         writeStore: writeStore,
         watchName: watchName,
+        watchNames: nameMap,
         rememberNames: rememberNames,
         namesFromSeries: namesFromSeries,
         favourites: {

@@ -97,14 +97,14 @@ function buildProxy() {
 }
 
 function reloadSetting() {
-	readJson();
-	renderJson();
+	return readJson();
 }
 
 function readJson() {
-	$.getJSON("data/config.json", function(data) {
+	return $.getJSON("data/config.json", function(data) {
 		dataArrays = data;
 		parseProxy(data.proxy); // 解析代理配置
+		renderJson();
 	});
 }
 

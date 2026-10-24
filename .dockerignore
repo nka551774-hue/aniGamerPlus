@@ -124,3 +124,22 @@ releases/
 logs/
 temp/
 cookie2.txt
+
+# Never copy local accounts, keys, VCS data or audit tooling into the image.
+.git/
+.codex/
+.agpwork/
+.idea/
+.vs/
+Dashboard/userdata.json
+Dashboard/sslkey/*.key
+Dashboard/sslkey/*.pem
+Dashboard/sslkey/*.crt
+cookies.pkl
+anime1me_list.txt
+video_list.json
+thumbnails/
+anime_info/
+catalog/
+tests/_shots/
+tests/fixtures/hls/

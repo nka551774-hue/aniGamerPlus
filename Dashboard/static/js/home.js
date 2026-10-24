@@ -88,15 +88,22 @@
 
     /* 每部作品最後看的是哪一集, 鍵是小寫的作品名. 片庫以外的集數靠觀看紀錄
        頁問回來的 state.remote 認, 所以線上看過、沒下載的作品在所有動畫裡也標得出來. */
+    var watchedCache = null;
+
     function lastWatchedByAnime() {
-        var result = {};
+        var names = AGP.watchNames();
+        if (watchedCache && watchedCache.names === names &&
+            watchedCache.times === state.times && watchedCache.videos === state.bySn) {
+            return watchedCache.result;
+        }
+        var result = Object.create(null);
         Object.keys(state.times).forEach(function (sn) {
             var entry = state.times[sn];
             if (!entry) { return; }
             var video = state.bySn[String(sn)];
             /* 片庫以外的: 先看這一份紀錄頁問回來的, 再看播放頁留下的名稱表 ——
                後者才是不必先開紀錄頁就認得出來的那一份 */
-            var remote = video ? null : (state.remote[String(sn)] || AGP.watchName(sn));
+            var remote = video ? null : (state.remote[String(sn)] || names[String(sn)]);
             if (!video && !remote) { return; }
             var name = video ? animeKey(video) : remote.name;
             var key = String(name || '').trim().toLowerCase();
@@ -114,6 +121,7 @@
                 duration: Number(entry.duration) || 0
             };
         });
+        watchedCache = { names: names, times: state.times, videos: state.bySn, result: result };
         return result;
     }
 
@@ -121,7 +129,7 @@
     function watchedLabel(name) {
         var last = lastWatchedByAnime()[String(name || '').trim().toLowerCase()];
         if (!last) { return ''; }
-        return (last.ended ? '看完' : '看到') + episodeLabel(last.episode);
+        return (last.ended ? '看完' : '看到') + episodeText(last.episode);
     }
 
     /* 作品資訊那一頁要的不只是「看到第幾集」, 還要進度條、剩餘時間, 以及按下去
@@ -494,6 +502,8 @@
        這種情況, 不是一集一個請求 */
     var HISTORY_LOOKUPS = 8;
     var HISTORY_ROWS = 200;
+    var HISTORY_RETRY_MS = 60000;
+    var historyAttempts = Object.create(null);
 
     function describeRow(row) {
         var video = state.bySn[row.sn];
@@ -506,7 +516,7 @@
                 local: true
             };
         }
-        var remote = state.remote[row.sn];
+        var remote = state.remote[row.sn] || AGP.watchName(row.sn);
         if (remote) {
             return {
                 name: remote.name,
@@ -521,6 +531,7 @@
 
     function indexSeries(detail) {
         if (!detail || !detail.groups) { return; }
+        watchedCache = null;
         detail.groups.forEach(function (group) {
             (group.episodes || []).forEach(function (episode) {
                 state.remote[String(episode.videoSn)] = {
@@ -541,19 +552,22 @@
         var tries = 0;
         try {
             while (tries < HISTORY_LOOKUPS) {
-                var pending = rows.filter(function (row) { return !describeRow(row); });
+                var now = Date.now();
+                var pending = rows.filter(function (row) {
+                    return !describeRow(row) &&
+                        (!historyAttempts[row.sn] || now - historyAttempts[row.sn] >= HISTORY_RETRY_MS);
+                });
                 if (!pending.length) { break; }
                 tries += 1;
                 var sn = pending[0].sn;
+                historyAttempts[sn] = now;
                 try {
                     var response = await fetch('./watch/series.json?id=' + encodeURIComponent(sn));
                     if (response.ok) {
                         indexSeries(await response.json());
-                        found = true;
+                        found = !!describeRow(pending[0]) || found;
                     }
                 } catch (error) { /* 認不出來就認不出來, 那一列還是列得出日期 */ }
-                /* 問過了就標記, 不然這一集永遠排在隊伍最前面把次數用光 */
-                if (!state.remote[sn]) { state.remote[sn] = null; }
             }
         } finally {
             state.resolving = false;
@@ -662,6 +676,7 @@
 
     async function dropHistory(sn) {
         delete state.times[String(sn)];
+        watchedCache = null;
         renderSection('homeHistory', renderHistory);
         renderSection('homeContinue', renderContinue);
         try {

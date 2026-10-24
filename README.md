@@ -33,7 +33,7 @@ windows 使用者可以[**點擊這裡**](https://github.com/AvianJay/aniGamerPl
 
 ## 源碼運行
 
-Python 版本 3 以上
+使用 Python 3.11（目前 CI 與 Docker 使用的版本）。自動登入的語音相依套件仍使用新版 Python 已移除的模組，暫不支援 Python 3.13 以上。
 
 下載源碼
 ```bash
@@ -142,7 +142,7 @@ docker run -td --name anigamerplus \
  - 自定義下載檔名前綴後綴及是否添加清晰度
  - 下載失敗, 下載過慢自動重啓任務
  - 支援使用FTP上傳至伺服器, 支援斷點續傳(適配Pure-Ftpd), 掉綫重傳, 支援 FTP over TLS
- - 支援插件系統, 可擴展上傳、播放與線上片庫的來源 (內建 Anime1.me)
+ - 支援插件系統, 可擴展上傳、播放與線上片庫的來源 (來源插件需另行安裝)
  - 檢查程序更新功能
  - 支援新番分類
  - v6.0 開始支援cookie自動刷新
@@ -636,11 +636,16 @@ Web控制臺截圖:
 
 開了帳號系統 (`dashboard.user_control.enabled`) 的話, 可以再把 `online_watch_requires_login` 打開, 要求登入才能線上看.
 
+Dashboard 會檢查瀏覽器修改操作的來源，包含舊版 GET 控制 API。
+若透過反向代理提供 HTTPS，代理需保留公開的 `Host`，並由受信任的代理傳遞
+`X-Forwarded-Proto`；不要將任意外部來源加入可信代理。否則來源與後端看到的網址不一致時，
+操作會收到 HTTP 403。原生 App 與命令列沒有瀏覽器來源標頭的請求仍依原有登入權限判斷。
+
 ### 其他片單來源
 
 「所有動畫」除了動畫瘋, 也可以列出插件提供的其他站. 開了這類插件, 篩選列會多一個「來源」選單, 搜尋會同時翻所有來源, 作品卡片角落標著來源名稱.
 
-**Anime1.me** 就是這樣的插件 (`plugins/anime1me.py`). 在 `config.json` 裡啟用它:
+**Anime1.me** 是這類插件的一個例子，本儲存庫已移除 `plugins/anime1me.py`，不再內建。只有另外安裝相容插件後，才可在 `config.json` 裡啟用它:
 
 ```json
 "plugins": { "enabled": ["anime1me"] }
@@ -678,7 +683,7 @@ def create_plugin(settings):
 | `download` | 可以下載單集 |
 | `subscribe` | 可以整部加入下載並追蹤新集數 |
 
-每個 hook 的參數與回傳格式寫在 `plugin_system.py` 的 `CatalogProvider` 說明裡, 完整的例子是 `plugins/anime1me.py`. 插件拋例外只會讓那個來源暫時沒東西, 不會讓片單或下載整個掛掉.
+每個 hook 的參數與回傳格式寫在 `plugin_system.py` 的 `CatalogProvider` 說明裡。插件拋例外只會讓那個來源暫時沒東西, 不會讓片單或下載整個掛掉.
 
 ## Flutter App
 

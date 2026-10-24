@@ -1377,7 +1377,17 @@ def custom_video_type_code(video_type):
     return str(code).zfill(2)
 
 
+_video_list_lock = threading.Lock()
+
+
 def updatelist():
+    # Downloads and the update loop can finish together. Keep snapshots in
+    # order and publish atomically, so a reader never sees half of a JSON file.
+    with _video_list_lock:
+        _updatelist()
+
+
+def _updatelist():
     db = read_db_all()
     my_list = {'videos': []}
     # my_list['danmu'] = settings['danmu']
@@ -1460,8 +1470,7 @@ def updatelist():
                 remote_exists = plugin_manager.has_remote(video_data)
                 if local_exists or remote_exists:
                     my_list['videos'].append(video_data)
-    with open(os.path.join(working_dir, 'video_list.json'), 'w', encoding='utf-8') as f:
-        json.dump(my_list, f)
+    Config.write_json_atomic(os.path.join(working_dir, 'video_list.json'), my_list)
 
 
 def checknow():

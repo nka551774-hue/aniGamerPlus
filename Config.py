@@ -1152,6 +1152,10 @@ def bahamut_request(method, url, **kwargs):
         return session.request(method, url, **kwargs)
     except curl_requests.RequestsError as e:
         raise requests.exceptions.RequestException(str(e)) from e
+    finally:
+        # Responses are buffered by default; their content remains available
+        # after closing the short-lived session and its connection pool.
+        session.close()
 
 
 def read_latest_version_on_github():
@@ -1265,6 +1269,11 @@ def add_sn_to_list(sn, mode='all'):
                 updated_content += newline
             __atomic_write(sn_list_path, updated_content)
         return {'added': added, 'updated': changed and not added}
+
+
+def write_json_atomic(path, data):
+    """Publish a complete JSON snapshot without exposing a truncated file."""
+    __atomic_write(path, json.dumps(data, ensure_ascii=False))
 
 
 def __atomic_write(path, text):

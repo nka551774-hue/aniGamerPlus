@@ -13,7 +13,7 @@ from bs4 import BeautifulSoup
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from plugins import anime1me  # noqa: E402
+anime1me = pytest.importorskip('plugins.anime1me', reason='optional Anime1.me plugin is not installed')
 
 
 CATEGORY_URL = 'https://anime1.me/category/2026%e5%b9%b4%e6%98%a5%e5%ad%a3/re0/'

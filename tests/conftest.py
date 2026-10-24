@@ -13,12 +13,10 @@ import pytest
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-playwright_api = pytest.importorskip('playwright.sync_api')
-
-
 @pytest.fixture(scope='session')
 def playwright_driver():
     """The one and only sync-API driver for the whole run."""
+    playwright_api = pytest.importorskip('playwright.sync_api')
     with playwright_api.sync_playwright() as driver:
         yield driver
 

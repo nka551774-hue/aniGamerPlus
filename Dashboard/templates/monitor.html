@@ -3,9 +3,16 @@
 	<head>
 		<meta charset="utf-8">
 		<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1">
-		<script src="./static/js/jquery-3.4.0.min.js"></script>
+		<script src="./static/js/jquery-3.7.1.min.js"></script>
 		<script src="./static/js/bootstrap.min.js"></script>
 		<script src="./static/layui/layui.js"></script>
+		<script>
+			// Reuse the patched jQuery instead of loading layui's older bundled copy.
+			layui.define(function (exports) {
+				layui.$ = window.jQuery;
+				exports('jquery', window.jQuery);
+			});
+		</script>
 		<script src="./static/js/monitor.js"></script>
 		<link rel="stylesheet" href="./static/css/bootstrap.rfs.min.css">
 		<link rel="stylesheet" href="./static/layui/css/layui.css">

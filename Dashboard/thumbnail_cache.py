@@ -16,6 +16,16 @@ from PIL import Image, ImageOps
 
 
 _encoders = threading.BoundedSemaphore(2)
+# Remote covers are untrusted. Pillow's default decompression-bomb threshold
+# allows much larger images than a thumbnail needs and initially only warns.
+MAX_SOURCE_PIXELS = 32_000_000
+THUMBNAIL_SIZE = (960, 960)
+
+
+def _check_image_size(image):
+    width, height = image.size
+    if width <= 0 or height <= 0 or width * height > MAX_SOURCE_PIXELS:
+        raise ValueError('Thumbnail source exceeds the pixel limit')
 
 
 def write_webp(source, destination):
@@ -25,16 +35,28 @@ def write_webp(source, destination):
     try:
         with _encoders:
             with Image.open(source) as original:
-                image = ImageOps.exif_transpose(original).convert('RGB')
-                image.thumbnail((960, 960), Image.Resampling.LANCZOS)
-                fd, temporary = tempfile.mkstemp(
-                    prefix='.webp-', suffix='.tmp', dir=destination.parent)
-                with os.fdopen(fd, 'wb') as handle:
-                    image.save(handle, format='WEBP', quality=82, method=4)
-                with Image.open(temporary) as check:
-                    check.load()
-                    if check.format != 'WEBP' or check.size != image.size:
-                        raise ValueError('Invalid WebP output')
+                _check_image_size(original)
+                # Shrink before EXIF transpose/RGB conversion: those operations
+                # otherwise allocate additional full-resolution pixel buffers.
+                # JPEG thumbnail() can also use the decoder's draft reduction.
+                # Palette/1-bit inputs need RGB first to retain LANCZOS filtering.
+                working = (original.convert('RGB')
+                           if original.mode in ('1', 'P') else original)
+                try:
+                    working.thumbnail(THUMBNAIL_SIZE, Image.Resampling.LANCZOS)
+                    with ImageOps.exif_transpose(working) as oriented:
+                        with oriented.convert('RGB') as image:
+                            fd, temporary = tempfile.mkstemp(
+                                prefix='.webp-', suffix='.tmp', dir=destination.parent)
+                            with os.fdopen(fd, 'wb') as handle:
+                                image.save(handle, format='WEBP', quality=82, method=4)
+                            with Image.open(temporary) as check:
+                                check.load()
+                                if check.format != 'WEBP' or check.size != image.size:
+                                    raise ValueError('Invalid WebP output')
+                finally:
+                    if working is not original:
+                        working.close()
             os.replace(temporary, destination)
     finally:
         if temporary and os.path.exists(temporary):
@@ -49,8 +71,12 @@ def convert_jpeg(source):
     if destination.exists() and destination.stat().st_mtime_ns >= source.stat().st_mtime_ns:
         try:
             with Image.open(destination) as check:
-                check.load()
-                reusable = check.format == 'WEBP'
+                _check_image_size(check)
+                if (check.format == 'WEBP' and
+                        check.width <= THUMBNAIL_SIZE[0] and
+                        check.height <= THUMBNAIL_SIZE[1]):
+                    check.load()
+                    reusable = True
         except (OSError, ValueError):
             pass
     if not reusable:

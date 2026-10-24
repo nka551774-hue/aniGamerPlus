@@ -25,6 +25,7 @@
 import asyncio
 import json, sys, os, re, time
 import tempfile
+import weakref
 import threading, traceback
 import random, string, hashlib, hmac, secrets
 import platform, shutil, subprocess
@@ -153,8 +154,56 @@ logging.getLogger('uvicorn.access').addHandler(handler)
 websocket_token = ''.join(random.sample(string.ascii_letters + string.digits, 32))
 
 
+def _origin_identity(value):
+    """Compare origins without accepting credentials or ignoring scheme/port."""
+    try:
+        parsed = urllib.parse.urlsplit(value)
+        if (parsed.scheme not in ('http', 'https') or not parsed.hostname
+                or parsed.username is not None or parsed.password is not None):
+            return None
+        return (parsed.scheme, parsed.hostname.lower(),
+                parsed.port or (443 if parsed.scheme == 'https' else 80))
+    except (TypeError, ValueError):
+        return None
+
+
+def _request_origin_allowed(request):
+    # Native apps/CLI omit these browser headers. Browser requests must prove
+    # they came from this origin, even when local deployments disable login.
+    if request.headers.get('sec-fetch-site', '').lower() in ('cross-site', 'same-site'):
+        return False
+    source = request.headers.get('origin') or request.headers.get('referer')
+    if not source:
+        return True
+    expected = _origin_identity('%s://%s' % (
+        request.url.scheme, request.headers.get('host', '')))
+    return expected is not None and _origin_identity(source) == expected
+
+
+def _request_changes_state(request):
+    if request.method not in ('GET', 'HEAD', 'OPTIONS'):
+        return True
+    # Retain legacy GET APIs used by existing clients, but protect their
+    # writes from navigation/image CSRF as well as cross-origin POSTs.
+    # Match Starlette's routing path: ASGI has already decoded percent escapes,
+    # and a deployment root_path is removed only at a path-segment boundary.
+    # Comparing the public URL directly misses /agp/checknow on mounted apps.
+    path = request.scope['path']
+    root_path = request.scope.get('root_path', '')
+    if root_path:
+        if path == root_path:
+            path = ''
+        elif path.startswith(root_path + '/'):
+            path = path[len(root_path):]
+    return (path in ('/checknow', '/logout')
+            or (path == '/watch/time'
+                and request.query_params.get('type') in ('set', 'del')))
+
+
 @app.middleware('http')
 async def add_accept_ranges(request: Request, call_next):
+    if _request_changes_state(request) and not _request_origin_allowed(request):
+        return JSONResponse({'detail': 'Cross-origin request denied'}, status_code=403)
     # 原 Flask 版 after_request 给每条回應都加 Accept-Ranges: bytes, 播放器和
     # 下载器靠它判断能不能断点续传, 原样保留.
     response = await call_next(request)
@@ -332,7 +381,8 @@ def _verify_password(user, password):
     if password_hash and _check_hash(password_hash, password):
         return True
     legacy_password = user.get('password')
-    return legacy_password is not None and secrets.compare_digest(str(legacy_password), password)
+    return legacy_password is not None and secrets.compare_digest(
+        str(legacy_password).encode('utf-8'), password.encode('utf-8'))
 
 
 def _normalize_user(user, fallback_role='user'):
@@ -690,12 +740,16 @@ async def _form_or_json(request):
     """Flask 版 `request.form if request.form else request.get_json()` 的等价写法."""
     try:
         form = await request.form()
+    except _RequestBodyTooLarge:
+        raise
     except Exception:
         form = None
     if form:
         return dict(form)
     try:
         data = await request.json()
+    except _RequestBodyTooLarge:
+        raise
     except Exception:
         return {}
     return data if isinstance(data, dict) else {}
@@ -705,12 +759,16 @@ async def _json_then_form(request):
     """Flask 版 `request.get_json() or request.form` 的等价写法 (register/webtime 用这个顺序)."""
     try:
         data = await request.json()
+    except _RequestBodyTooLarge:
+        raise
     except Exception:
         data = None
     if isinstance(data, dict) and data:
         return data
     try:
         form = await request.form()
+    except _RequestBodyTooLarge:
+        raise
     except Exception:
         return {}
     return dict(form)
@@ -745,6 +803,8 @@ def _run_console_command_blocking(raw_command):
 async def _handle_web_console_command(request):
     try:
         payload = await request.json()
+    except _RequestBodyTooLarge:
+        raise
     except Exception:
         payload = {}
     if not isinstance(payload, dict):
@@ -827,7 +887,10 @@ def _find_video_path(sn, resolution=None):
 
 _ffmpeg_path_cache = None
 _ffmpeg_missing_logged = False
-_keyed_locks = {}
+# A waiting/active caller holds a strong reference to its lock. Once the last
+# caller exits, reclaim it instead of retaining every user-supplied cache key
+# (in particular arbitrary stream resolution values) for the process lifetime.
+_keyed_locks = weakref.WeakValueDictionary()
 _keyed_locks_guard = threading.Lock()
 _thumbnail_failures = {}
 
@@ -858,9 +921,11 @@ _thumbnail_migration_lock = threading.Lock()
 def _keyed_lock(name):
     # 同一集同时被多个卡片请求时, 只干一次活
     with _keyed_locks_guard:
-        if name not in _keyed_locks:
-            _keyed_locks[name] = threading.Lock()
-        return _keyed_locks[name]
+        lock = _keyed_locks.get(name)
+        if lock is None:
+            lock = threading.Lock()
+            _keyed_locks[name] = lock
+        return lock
 
 
 def _offload(func, *args, **kwargs):
@@ -872,7 +937,12 @@ def _offload(func, *args, **kwargs):
 
 def _curl_perform(session_kwargs, url, request_kwargs):
     session = curl_requests.Session(**session_kwargs)
-    return session.request('get', url, **request_kwargs)
+    try:
+        return session.request('get', url, **request_kwargs)
+    finally:
+        # These requests buffer their response; no consumer needs the session
+        # afterwards. Release libcurl handles on both success and exceptions.
+        session.close()
 
 
 def _bahamut_get(url, timeout=10, allow_redirects=True, extra_headers=None):
@@ -1380,8 +1450,14 @@ def _issue_cast_ticket(sn, user, now=None):
 
 def _cast_ticket_user(ticket, sn, userdata=None, now=None):
     """票對得上這一集而且還沒過期, 就回發票的那個帳號; 否則 None."""
-    parts = str(ticket or '').split('.')
-    if len(parts) != 3 or not parts[0].isdigit() or not str(sn or '').isdigit():
+    # Validate the complete wire format before integer conversion or account
+    # I/O: Unicode digits and compare_digest(non-ASCII str) otherwise raise,
+    # and unbounded decimal timestamps exceed Python's integer input limit.
+    if not isinstance(ticket, str) or not re.fullmatch(
+            r'[0-9]{1,12}\.[0-9a-f]{16}\.[0-9a-f]{32}', ticket):
+        return None
+    parts = ticket.split('.')
+    if not str(sn or '').isdigit():
         return None
     expires = int(parts[0])
     if expires < (time.time() if now is None else now):
@@ -1794,11 +1870,20 @@ def _hls_parse_playlist(text):
                 pending_duration = float(line.split(':', 1)[1].split(',')[0])
             except (IndexError, ValueError):
                 pending_duration = float(target_duration)
-        elif not line.startswith('#') and re.match(r'media_b.+ts', line):
-            # 必須跟 Anime.py.download_chunk 用同一個表達式取檔名, 否則伺服器 stat
-            # 的名字會跟下載器寫下的名字對不起來
+        elif not line.startswith('#'):
+            # Match the downloader's filename contract. Subdirectories,
+            # backslashes, encoded separators and absolute URLs must never
+            # become local paths. Reject the entire playlist instead of
+            # dropping an unsafe segment and shifting AES sequence numbers.
+            try:
+                uri = urllib.parse.urlsplit(line)
+            except ValueError:
+                return None
+            if (uri.scheme or uri.netloc
+                    or not re.fullmatch(r'media_b[A-Za-z0-9_.-]+\.ts', uri.path)):
+                return None
             segments.append({
-                'name': re.findall(r'media_b.+ts', line)[0],
+                'name': uri.path,
                 'extinf': pending_extinf or '#EXTINF:%.3f,' % pending_duration,
                 'duration': pending_duration,
             })
@@ -2531,6 +2616,8 @@ async def add_sn_list_entry(request: Request):
         return denied
     try:
         data = await request.json()
+    except _RequestBodyTooLarge:
+        raise
     except Exception:
         return JSONResponse({'detail': 'Invalid JSON body'}, status_code=400)
     return await run_in_threadpool(_add_sn_list_entry_blocking, request, data)
@@ -2572,6 +2659,8 @@ async def web_console_command(request: Request):
         return denied
     try:
         payload = await request.json()
+    except _RequestBodyTooLarge:
+        raise
     except Exception:
         payload = {}
     return await run_in_threadpool(_web_console_command_blocking, request, payload)
@@ -2995,6 +3084,8 @@ async def catalog_download(request: Request):
         return denied
     try:
         data = await request.json()
+    except _RequestBodyTooLarge:
+        raise
     except Exception:
         data = None
     if not isinstance(data, dict):
@@ -3337,9 +3428,13 @@ def getvid(request: Request):
 
     sn = request.query_params.get('id')
     res = request.query_params.get('res')
+    try:
+        plugin_resolution = int(res) if res and res.isdecimal() else 0
+    except (ValueError, OverflowError):
+        plugin_resolution = 0
     playback_source = plugin_manager.resolve_playback_source({
         'sn': str(sn),
-        'resolution': int(res) if res and str(res).isdigit() else 0,
+        'resolution': plugin_resolution,
     })
     if playback_source and playback_source.get('url'):
         return _redirect(playback_source['url'])
@@ -3940,18 +4035,22 @@ def _login_blocking(request, reqdata):
             fresh = find_user_by_username(username, userdata)
             if fresh is None:
                 return (None, False)
+            # A password reset can replace the hash and rotate the token
+            # after the snapshot was verified. Never hand its new token to
+            # a request that only proved knowledge of the previous password.
             if fresh.get('password') is None:
-                return (fresh.get('token'), False)
+                return (fresh.get('token') if _verify_password(fresh, password) else None, False)
             if legacy_pw is not None and fresh.get('password') != legacy_pw:
                 if not _verify_password(fresh, password):
-                    return (fresh.get('token'), False)
+                    return (None, False)
             fresh['password_hash'] = new_hash
             fresh.pop('password', None)
             return (fresh.get('token'), True)
 
         migrated_token = update_user_data(_migrate)
-        if migrated_token:
-            token = migrated_token
+        if not migrated_token:
+            return _redirect('./login?error=1')
+        token = migrated_token
 
     destination = './watch' if Config.read_settings()['dashboard'].get('online_watch') else './control'
     response = _redirect(destination)
