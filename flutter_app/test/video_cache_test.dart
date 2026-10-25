@@ -25,6 +25,7 @@ class Upstream {
   int requests = 0;
   bool refuse = false;
   bool corruptRange = false;
+  bool changeRangeValidator = false;
   final List<String?> validators = [];
 
   /// 每 64 KB 之間歇一下, 用來模擬一條慢線路
@@ -103,7 +104,11 @@ class Upstream {
               'bytes ${start + 1}-$end/${data.length}');
         }
       }
-      response.headers.set(HttpHeaders.etagHeader, '"stub-v1"');
+      response.headers.set(
+          HttpHeaders.etagHeader,
+          upstream.changeRangeValidator && header != 'bytes=0-0'
+              ? '"stub-v2"'
+              : '"stub-v1"');
       response.headers.set(HttpHeaders.acceptRangesHeader, 'bytes');
       // 一塊一塊送, 而且走 addStream —— 這樣「送出去多少」才會跟著對面讀多快
       const step = 64 * 1024;
@@ -242,6 +247,24 @@ void main() {
     upstream.corruptRange = false;
     expect(
         await fetch(url, range: 'bytes=0-100'), upstream.data.sublist(0, 101));
+  });
+
+  test('changed range validator cannot populate the previous video cache',
+      () async {
+    final url = cache.wrap(
+        upstream: upstream.url, headers: const {}, key: 'changed-validator');
+    upstream.changeRangeValidator = true;
+    try {
+      final invalid = await fetch(url, range: 'bytes=0-100');
+      expect(invalid, isNot(upstream.data.sublist(0, 101)));
+    } on HttpException {
+      // Refuse the changed representation before any byte is cached.
+    }
+    upstream.changeRangeValidator = false;
+    final before = upstream.requests;
+    expect(
+        await fetch(url, range: 'bytes=0-100'), upstream.data.sublist(0, 101));
+    expect(upstream.requests, greaterThan(before));
   });
 
   for (final tail in [false, true]) {

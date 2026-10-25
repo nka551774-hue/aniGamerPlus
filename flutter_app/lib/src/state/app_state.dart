@@ -264,6 +264,7 @@ class AppState extends ChangeNotifier {
   }
 
   Future<void> refreshLibrary() async {
+    final version = client.contextVersion;
     if (offline || !hasServer) {
       library = downloads.asVideoItems();
       _indexLibrary();
@@ -273,7 +274,10 @@ class AppState extends ChangeNotifier {
     try {
       // 帶著上次的 ETag 去問. 沒有新集數的話伺服器只回一個 304, 手上那份原封
       // 不動 —— 四千集的片庫是 2.7 MB, 每次開 app 重抓一遍太浪費了.
-      final fresh = await client.videoListIfChanged(await _libraryEtag());
+      final etag = await _libraryEtag();
+      if (version != client.contextVersion) return;
+      final fresh = await client.videoListIfChanged(etag);
+      if (version != client.contextVersion) return;
       if (fresh.notModified && library.isNotEmpty) {
         lastError = '';
         notifyListeners();
@@ -289,6 +293,9 @@ class AppState extends ChangeNotifier {
       }
       lastError = '';
     } on ApiException catch (error) {
+      // A rejected stale response must not replace the newer account's state
+      // with this request's cached/offline fallback either.
+      if (version != client.contextVersion) return;
       if (error.needsLogin) {
         library = const [];
       } else {
@@ -297,6 +304,7 @@ class AppState extends ChangeNotifier {
       _indexLibrary();
       lastError = error.message;
     } catch (error) {
+      if (version != client.contextVersion) return;
       offline = true;
       lastError = error.toString();
       library = _cachedLibrary();
@@ -506,6 +514,7 @@ class AppState extends ChangeNotifier {
 
   /// 進度是跟著帳號走的, 換人 (或登出) 就整份丟掉.
   Future<void> _clearWatchTimes() async {
+    final version = client.contextVersion;
     _watchTimesWrite?.cancel();
     _watchTimesWrite = null;
     watchTimes = const {};
@@ -513,6 +522,7 @@ class AppState extends ChangeNotifier {
     _watchTimesLoaded = false;
     try {
       final file = await _watchTimesFile();
+      if (version != client.contextVersion) return;
       if (file.existsSync()) await file.delete();
     } catch (_) {
       // 刪不掉就算了, 下次登入時的合併頂多多幾筆別人的紀錄
@@ -682,11 +692,20 @@ class AppState extends ChangeNotifier {
   }
 
   Future<void> logout() async {
+    final version = client.contextVersion;
     await discord.forget(bestEffort: true);
+    if (version != client.contextVersion) return;
+    final server = client.baseUrl;
     await client.logout();
+    // AgpClient preserves a newer login/server when this request returns late;
+    // the persistent token and account UI must follow the same decision.
+    if (client.baseUrl != server || client.token != null) return;
+    final loggedOutVersion = client.contextVersion;
     await prefs.clearToken();
+    if (loggedOutVersion != client.contextVersion) return;
     currentUser = null;
     await _clearWatchTimes();
+    if (loggedOutVersion != client.contextVersion) return;
     await refreshAll();
   }
 

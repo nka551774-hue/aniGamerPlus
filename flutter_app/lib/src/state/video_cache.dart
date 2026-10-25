@@ -886,6 +886,9 @@ class _CacheWorker {
       }
       final status = response.statusCode;
       final range = ByteContentRange.parse(response.headers['content-range']);
+      final validator = meta.etag.isNotEmpty ? meta.etag : meta.modified;
+      final returnedValidator =
+          response.headers[meta.etag.isNotEmpty ? 'etag' : 'last-modified'];
       // Every cached byte must have the promised offset and file identity.
       // 200 after If-Range means the representation changed; appending it
       // would mix two videos even when their file lengths happen to match.
@@ -894,6 +897,9 @@ class _CacheWorker {
           range.start != at ||
           range.end > to ||
           range.total != meta.total ||
+          (validator.isNotEmpty &&
+              returnedValidator != null &&
+              returnedValidator != validator) ||
           (response.contentLength != null &&
               response.contentLength != range.length)) {
         await response.stream.listen((_) {}).cancel();

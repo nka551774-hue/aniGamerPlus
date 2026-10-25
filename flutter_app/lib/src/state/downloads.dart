@@ -720,13 +720,25 @@ class DownloadStore extends ChangeNotifier {
 
       final response = await job.client.send(request);
       if (job.cancelled || _disposed) return;
+      final returnedValidator = entry.resumeValidator.startsWith('"')
+          ? response.headers['etag']
+          : response.headers['last-modified'];
+      if (start > 0 &&
+          (response.statusCode == 206 || response.statusCode == 416) &&
+          returnedValidator != null &&
+          returnedValidator != entry.resumeValidator) {
+        throw const HttpException('續傳回應的影片版本已變更');
+      }
 
       if (response.statusCode == 416) {
         // A rejected range can also mean the server replaced/truncated the
-        // video. Only a matching, nonempty total proves this part is complete.
+        // video. Require both its nonempty total and original validator before
+        // treating an unsatisfied range as an already complete partial file.
         final total = ByteContentRange.unsatisfiedTotal(
             response.headers['content-range']);
-        if (start <= 0 || total != start) {
+        if (start <= 0 ||
+            total != start ||
+            returnedValidator != entry.resumeValidator) {
           throw const HttpException('續傳範圍與伺服器檔案長度不符');
         }
         await part.rename(target.path);
@@ -761,10 +773,13 @@ class DownloadStore extends ChangeNotifier {
       }
 
       // 200 表示伺服器不吃 Range (或檔案換了), 那就從頭來
-      if (response.statusCode == 200 && start > 0) {
-        start = 0;
-        if (await part.exists()) await part.delete();
-      }
+      if (response.statusCode == 200) start = 0;
+
+      // Remove stale bytes before publishing their replacement's identity.
+      // A process stop after _save must never leave a new If-Range validator
+      // beside a partial file from a different server or representation.
+      if (start == 0) await part.writeAsBytes(const [], flush: true);
+      if (job.cancelled || _disposed) return;
 
       final length = response.contentLength ?? 0;
       entry.total = range?.total ?? length;

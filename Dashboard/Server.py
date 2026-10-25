@@ -23,6 +23,7 @@
 # event loop.
 
 import asyncio
+import math
 import json, sys, os, re, time
 import tempfile
 import errno
@@ -1892,6 +1893,28 @@ def _hls_task(sn):
         return None
 
 
+def _hls_supported_media(text):
+    """The proxy can represent one AES-128 key and independent TS segments.
+
+    Reject timelines/resources that our renderer cannot preserve instead of
+    emitting a playable-looking playlist with different decryption semantics.
+    """
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    keys = [line for line in lines if line.startswith('#EXT-X-KEY:')]
+    if not lines or lines[0] != '#EXTM3U' or len(keys) != 1:
+        return False
+    key = keys[0]
+    if (not re.search(r'(?:[:,])METHOD=AES-128(?:,|$)', key)
+            or not re.search(r'(?:[:,])URI="[^"\r\n]+"(?:,|$)', key)
+            or len(re.findall(r'(?:[:,])\s*URI\s*=', key, re.I)) != 1
+            or len(re.findall(r'(?:[:,])\s*METHOD\s*=', key, re.I)) != 1
+            or ('KEYFORMAT=' in key and 'KEYFORMAT="identity"' not in key)):
+        return False
+    unsupported = ('#EXT-X-MAP:', '#EXT-X-BYTERANGE:', '#EXT-X-DISCONTINUITY',
+                   '#EXT-X-GAP', '#EXT-X-I-FRAMES-ONLY', '#EXT-X-PART:', '#EXT-X-SKIP:')
+    return not any(line.startswith(unsupported) for line in lines)
+
+
 def _hls_parse_playlist(text):
     """從 *遠端原始* m3u8 取出有序的 (時長, chunk 檔名).
 
@@ -1900,11 +1923,12 @@ def _hls_parse_playlist(text):
     給 ffmpeg 吃的版本 —— 絕對路徑、雙反斜線、key 指向 key.m3u8key. 那個型態絕對
     不能發給瀏覽器, 所以這裡看到就直接回 None.
     """
-    if HLS_LOCALISED_MARKER in text or '\\\\' in text:
+    if HLS_LOCALISED_MARKER in text or '\\\\' in text or not _hls_supported_media(text):
         return None
 
     key_line = ''
     target_duration = 10
+    media_sequence = 0
     segments = []
     pending_extinf = None
     pending_duration = 10.0
@@ -1917,15 +1941,27 @@ def _hls_parse_playlist(text):
             key_line = line
         elif line.startswith('#EXT-X-TARGETDURATION'):
             try:
-                target_duration = int(float(line.split(':', 1)[1]))
-            except (IndexError, ValueError):
-                pass
+                value = float(line.split(':', 1)[1])
+                if not math.isfinite(value) or value <= 0:
+                    return None
+                target_duration = max(1, int(value))
+            except (IndexError, ValueError, OverflowError):
+                return None
+        elif line.startswith('#EXT-X-MEDIA-SEQUENCE:'):
+            value = line.split(':', 1)[1]
+            if not re.fullmatch(r'[0-9]{1,20}', value):
+                return None
+            media_sequence = int(value)
+            if media_sequence >= 2 ** 64:
+                return None
         elif line.startswith('#EXTINF'):
             pending_extinf = line
             try:
                 pending_duration = float(line.split(':', 1)[1].split(',')[0])
+                if not math.isfinite(pending_duration) or pending_duration <= 0:
+                    return None
             except (IndexError, ValueError):
-                pending_duration = float(target_duration)
+                return None
         elif not line.startswith('#'):
             # Match the downloader's filename contract. Subdirectories,
             # backslashes, encoded separators and absolute URLs must never
@@ -1952,12 +1988,14 @@ def _hls_parse_playlist(text):
     return {
         'key_line': key_line,
         'target_duration': max(1, target_duration),
+        'media_sequence': media_sequence,
         'segments': segments,
         'total_duration': sum(s['duration'] for s in segments),
         # 重試任務可能改抓別的清晰度, chunk 名字裡的位元率就變了. 前端記住這個值,
         # 一旦變了就整個重建播放器, 而不是讓 hls.js 接到另一條串流上去
         'playlist_id': hashlib.md5(
-            '|'.join(s['name'] for s in segments).encode('utf-8')).hexdigest()[:12],
+            ('%s|%s|' % (media_sequence, key_line)
+             + '|'.join(s['name'] for s in segments)).encode('utf-8')).hexdigest()[:12],
     }
 
 
@@ -2051,9 +2089,8 @@ def _hls_render(sn, parsed, ready, complete, ticket=None):
         '#EXTM3U',
         '#EXT-X-VERSION:3',
         '#EXT-X-TARGETDURATION:%d' % parsed['target_duration'],
-        # 不重新編號: #EXT-X-KEY 沒帶 IV 的時候, IV 就是分片的序號. 前綴從 0 開始配上
-        # MEDIA-SEQUENCE:0, 序號才對得上解密用的 IV
-        '#EXT-X-MEDIA-SEQUENCE:0',
+        # Without an explicit IV, AES-128 uses the original media sequence.
+        '#EXT-X-MEDIA-SEQUENCE:%d' % parsed.get('media_sequence', 0),
         '#EXT-X-PLAYLIST-TYPE:EVENT',
         # 沒有 ENDLIST 之前 hls.js 一律當直播看待, 預設會從尾端往回三個 targetduration
         # 開始播 —— 也就是把已經下載好的部分整個跳過. 原生播放器也吃這一行
@@ -2285,6 +2322,8 @@ def _stream_parse_media(text):
     是拿同一個名字去 stat 磁碟上的分片, 帶著查詢字串就對不上了. 代理要的剛好相反
     —— 原樣的 URI 才組得回回源網址. 所以這裡什麼都不砍, 也不挑檔名長什麼樣子.
     """
+    if not _hls_supported_media(text):
+        return None
     key_line = ''
     key_uri = ''
     target_duration = 10
@@ -2303,9 +2342,12 @@ def _stream_parse_media(text):
             key_uri = match.group(1) if match else ''
         elif line.startswith('#EXT-X-TARGETDURATION'):
             try:
-                target_duration = max(1, int(float(line.split(':', 1)[1])))
-            except (IndexError, ValueError):
-                pass
+                value = float(line.split(':', 1)[1])
+                if not math.isfinite(value) or value <= 0:
+                    return None
+                target_duration = max(1, int(value))
+            except (IndexError, ValueError, OverflowError):
+                return None
         elif line.startswith('#EXT-X-MEDIA-SEQUENCE:'):
             value = line.split(':', 1)[1]
             if not re.fullmatch(r'[0-9]{1,20}', value):
@@ -2317,8 +2359,10 @@ def _stream_parse_media(text):
             pending_extinf = line
             try:
                 pending_duration = float(line.split(':', 1)[1].split(',')[0])
+                if not math.isfinite(pending_duration) or pending_duration <= 0:
+                    return None
             except (IndexError, ValueError):
-                pending_duration = float(target_duration)
+                return None
         elif not line.startswith('#'):
             segments.append({
                 'uri': line,

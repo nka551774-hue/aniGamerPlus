@@ -819,6 +819,15 @@ class Anime:
             raise ValueError('Invalid segment filename')
         if len(set(chunk_names)) != len(chunk_names):
             raise ValueError('Duplicate segment filename')
+        # A retry may obtain a different AES key while retaining the same TS
+        # names. The live HLS endpoint treats existing files as ready, so old
+        # ciphertext must disappear before the new playlist/key is published.
+        # download() serializes retries for this episode and joins old workers.
+        with os.scandir(temp_dir) as previous:
+            for entry in previous:
+                if (entry.is_file() and
+                        re.fullmatch(r'media_b[A-Za-z0-9_.-]+\.ts(?:\.part)?', entry.name)):
+                    os.unlink(entry.path)
         with open(m3u8_path, 'w', encoding='utf-8') as f:  # 保存 m3u8 文件在本地
             f.write(m3u8_text)
 

@@ -170,3 +170,23 @@ flutter test --dart-define=APP_UPDATER=false test/app_updater_build_test.dart
 仍未執行真實動畫瘋帳號登入／下載、Android/iOS release build、實體裝置播放或 Docker 建置；上面的離線測試不等於這些環境已驗證。第一輪記載的 Requests 相依上限仍存在，本輪沒有為消除通報而強行放寬 solver 約束。HLS proxy 的 URI 相容修正不代表全面 SSRF 防護，也沒有新增跨程序檔案互斥保證。
 
 Windows CA 路徑相容處理仍需要系統暫存目錄可由目前 ANSI code page 表示；若使用者名稱與 TEMP 本身也不可表示，會保留錯誤而不關閉 TLS 驗證，需將 TEMP 設至可表示且可寫的目錄。憑證副本於本程序中快取，更新信任憑證後應重新啟動程式。
+
+## 第三輪下載與播放交叉檢查
+
+日期：2026-10-25；基準提交 `25e372f`。本輪沿下載重試、HLS 時間線、帳戶切換及原生客戶端續傳流程檢查，未讀取實際帳戶檔、執行真實服務下載或修改相依套件。
+
+| 可重現問題 | 修復與回歸證據 |
+| --- | --- |
+| 本地 EVENT HLS 將來源 `MEDIA-SEQUENCE:42` 重寫成 0，沒有顯式 IV 時會改變 AES 解密序號 | 保留來源序號，播放清單識別碼同時納入序號與金鑰行；既有零起點與顯式 IV 行為保持。 |
+| 本地與回源代理解析器把多金鑰、未加密切換、MAP／BYTERANGE／DISCONTINUITY 當作可忽略標記，輸出語意不同的清單；非有限／負數時長可進入狀態 | 兩個解析器共用支援範圍檢查，明確拒絕無法保留的時間線及資源格式；拒絕 NaN、Infinity 及非正數時長。17 個新案例先全數失敗，修復後與既有 HLS／stream 測試共 75 項通過。 |
+| 分片下載失敗後重試仍留有舊 `.ts`／`.part`；新金鑰到達時，HLS 的就緒掃描會把舊密文當成新分片 | 在發佈新清單／金鑰前，清除下載器命名契約範圍內的舊分片與部分檔案；保留其他檔案。失敗案例觀察到換鑰前兩個舊檔都存在，修復後均不存在；下載及真實 ffmpeg HLS 套件 34 項通過。 |
+| 晚到的登出回應雖未覆蓋 API client 新 token，AppState 仍清空磁碟 token | AppState 在 Discord 清理、登出回應及本機清理後檢查上下文，保留已切換的伺服器或新登入。回歸以延遲的登出回應驗證記憶體與持久化 token 均保留。 |
+| API client 已拒絕舊片庫回應，但 AppState 的例外分支仍用舊快取覆蓋新片庫；登出等待檔案路徑後可能刪到新帳戶觀看檔 | 在片庫請求的 await 邊界與錯誤處理、觀看檔刪除前確認上下文。兩個延遲回歸先分別重現新片庫變空與新檔遭刪，修復後通過。另保留舊觀看 API 回應被 client 擋住的正向控制，未重寫已正確的 client 行為。 |
+| 切換來源／重抓時，先儲存新 validator 再截斷舊部分檔；當機後可能以新 validator 續接舊 bytes | 開始新的完整內容前先完成部分檔截斷，再發佈新來源與 validator。回歸在身分資料發佈通知時讀取磁碟，從原先仍有 `[1,2,3]` 改為空檔。 |
+| 206 回應明確換了 ETag 仍可接到舊部分檔；416 只比長度而未確認檔案身分；影片快取同樣未核對回應 validator | 下載與 isolate 快取拒絕明確不符的 ETag／Last-Modified；416 完成判斷要求長度與原 validator 同時相符。測試覆蓋錯誤／缺少／正確 validator，並確認被拒絕的快取資料仍需重新回源。 |
+
+此輪強化正確性與故障恢復，沒有新增整體下載速度或記憶體改善百分比。HLS 仍限定既有的單一 AES-128 金鑰與獨立 TS 模式；不支援格式會回報不可用，並未實作通用多金鑰或 fMP4 播放。清除重試殘留不等於多程序鎖，也不會撤回已送出的網路分片。Flutter 的 Range 改動適用 Dart 前景下載及影片快取；iOS URLSession 原生背景下載仍需裝置驗證。
+
+第三輪最終完整離線驗證：Python **587 passed、1 skipped、61 warnings，154.54 秒**；唯一跳過仍為已移除的可選 Anime1.me 插件，警告仍來自既有相依套件淘汰提示。真實 ffmpeg 合成 HLS、解密、檔案發佈與 Chromium 網頁測試均有執行。Flutter 3.47.8 / Dart 3.13.7 完整 **386 passed，49 秒**；`flutter analyze --no-fatal-infos` 回報 **No issues found，40.4 秒**。這是納入複審兩項帳戶狀態修復及三項回歸後的完整重跑；未變更 Python，因此保留先前完整結果。`APP_UPDATER=false` 組態於追加帳戶修復前另 **2 passed**。`pip check` 和 `git diff --check` 通過。
+
+Flutter 驗證沿用整個儲存庫的暫時 ASCII 磁碟映射，避免 Unicode SDK 分析問題且保留外層測試素材位置；驗證後移除映射。本輪仍未執行真實動畫瘋登入／下載、Android/iOS release build、實體裝置播放或 Docker 建置。驗證命令與第二輪相同；新的離線回歸已納入完整套件。

@@ -104,6 +104,33 @@ def test_segment_workers_are_reused_and_localisation_keeps_query_and_iv(download
     assert anime_module.Config.tasks_progress_rate[123]['rate'] == 100
 
 
+def test_retry_removes_previous_ciphertext_before_replacing_the_key(downloader, monkeypatch):
+    anime, state = downloader
+    temp = Path(anime._temp_dir) / '123-downloading-by-aniGamerPlusPlus'
+    temp.mkdir()
+    old_segment = temp / 'media_b1_0.ts'
+    old_segment.write_bytes(b'encrypted with previous key')
+    old_partial = temp / 'media_b1_1.ts.part'
+    old_partial.write_bytes(b'incomplete previous attempt')
+    unrelated = temp / 'notes.txt'
+    unrelated.write_text('keep this', encoding='utf-8')
+    request = anime._Anime__request
+    stale_at_key_fetch = []
+
+    def inspect(url, **kwargs):
+        if url == KEY_URL:
+            stale_at_key_fetch.extend([old_segment.exists(), old_partial.exists()])
+            assert unrelated.read_text(encoding='utf-8') == 'keep this'
+        return request(url, **kwargs)
+
+    monkeypatch.setattr(anime, '_Anime__request', inspect)
+    anime._Anime__segment_download_mode('1080')
+    assert stale_at_key_fetch == [False, False]
+    # Successful merging removes the owned temp directory; before publication
+    # the cleanup must only target downloader-owned ciphertext and partials.
+    assert Path(anime.local_video_path).read_bytes() == b'new output'
+
+
 @pytest.mark.parametrize('name', [
     '../media_b1_0.ts', 'media_b/../../outside.ts', r'media_b\..\outside.ts',
     'media_b1_0.ts/../../outside.ts', 'media_b%2f..%2foutside.ts',
