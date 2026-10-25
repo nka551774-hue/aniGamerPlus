@@ -51,6 +51,7 @@ void main() {
   });
 
   tearDown(() async {
+    await state.flushWatchTimesToDisk();
     state.downloadNetwork.dispose();
     state.downloadBackground.dispose();
     state.downloads.dispose();
@@ -152,5 +153,109 @@ void main() {
     await logout;
     expect(await watch.exists(), isTrue);
     expect(await watch.readAsString(), contains('999'));
+  });
+
+  test('late watch deletion cannot erase a new account entry', () async {
+    final started = Completer<void>();
+    final response = Completer<http.Response>();
+    reply = (request) async {
+      if (request.method == 'POST' && request.url.path == '/watch/time') {
+        started.complete();
+        return response.future;
+      }
+      return http.Response('{}', 200);
+    };
+    state.watchTimes = {'123': WatchTime(time: 7)};
+    final deleting = state.forgetWatchTime('123');
+    await started.future;
+    state.client.token = 'new-token';
+    state.noteWatchTime('123', WatchTime(time: 42), pending: true);
+    response.complete(http.Response('{}', 200));
+    await deleting;
+    expect(state.watchTimeOf('123')?.time, 42);
+    expect(state.isWatchTimePending('123'), isTrue);
+  });
+
+  test('delayed watch save cannot overwrite a new account file', () async {
+    paths.supportStarted = Completer<void>();
+    paths.supportResult = Completer<String?>();
+    state.watchTimes = {'123': WatchTime(time: 7)};
+    final saving = state.flushWatchTimesToDisk();
+    await paths.supportStarted!.future;
+    state.client.token = 'new-token';
+    state.watchTimes = {'999': WatchTime(time: 42)};
+    final watch = File('${temp.path}/watch-times.json');
+    await watch.writeAsString('{"999":{"time":42}}');
+    paths.supportResult!.complete(temp.path);
+    await saving;
+    expect(await watch.readAsString(), contains('999'));
+    expect(await watch.readAsString(), isNot(contains('123')));
+  });
+
+  test('delayed watch load cannot merge data into a new account', () async {
+    final watch = File('${temp.path}/watch-times.json');
+    await watch.writeAsString('{"123":{"time":7,"dirty":true}}');
+    paths.supportStarted = Completer<void>();
+    paths.supportResult = Completer<String?>();
+    final loading = state.refreshWatchTimes();
+    await paths.supportStarted!.future;
+    state.client.token = 'new-token';
+    state.watchTimes = {'999': WatchTime(time: 42)};
+    paths.supportResult!.complete(temp.path);
+    await loading;
+    expect(state.watchTimes.keys, ['999']);
+    expect(state.hasPendingWatchTimes, isFalse);
+  });
+
+  test('watch sync acknowledgement preserves progress updated in flight',
+      () async {
+    final started = Completer<void>();
+    final response = Completer<http.Response>();
+    state.serverInfo = ServerInfo(userControl: true);
+    state.currentUser = CurrentUser(username: 'old-user');
+    reply = (request) async {
+      if (request.method == 'POST' && request.url.path == '/watch/time') {
+        started.complete();
+        return response.future;
+      }
+      return http.Response('{}', 200);
+    };
+    state.noteWatchTime('123', WatchTime(time: 7), pending: true);
+    final syncing = state.flushPendingWatchTimes();
+    await started.future;
+    state.noteWatchTime('123', WatchTime(time: 42), pending: true);
+    response.complete(http.Response('{}', 200));
+    await syncing;
+    expect(state.watchTimeOf('123')?.time, 42);
+    expect(state.isWatchTimePending('123'), isTrue);
+  });
+
+  test('watch sync stops submitting its old batch after an account change',
+      () async {
+    final started = Completer<void>();
+    final response = Completer<http.Response>();
+    final posts = <http.Request>[];
+    state.serverInfo = ServerInfo(userControl: true);
+    state.currentUser = CurrentUser(username: 'old-user');
+    reply = (request) async {
+      if (request.method == 'POST' && request.url.path == '/watch/time') {
+        posts.add(request);
+        if (posts.length == 1) {
+          started.complete();
+          return response.future;
+        }
+      }
+      return http.Response('{}', 200);
+    };
+    state.noteWatchTime('123', WatchTime(time: 7), pending: true);
+    state.noteWatchTime('456', WatchTime(time: 8), pending: true);
+    final syncing = state.flushPendingWatchTimes();
+    await started.future;
+    state.client.token = 'new-token';
+    state.noteWatchTime('456', WatchTime(time: 42), pending: true);
+    response.complete(http.Response('{}', 200));
+    await syncing;
+    expect(posts, hasLength(1));
+    expect(state.isWatchTimePending('456'), isTrue);
   });
 }

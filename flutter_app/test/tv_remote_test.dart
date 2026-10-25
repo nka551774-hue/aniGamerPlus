@@ -84,6 +84,7 @@ void main() {
   final clients = <TvRemoteClient>[];
   var saved = <TvDevice>[];
   final discordTransfers = <(String, String)>[];
+  Future<void> Function(List<PairedPhone>)? savePairing;
 
   TvRemoteClient phone({String id = 'phone-1', String name = 'Pixel'}) {
     final client = TvRemoteClient(
@@ -110,12 +111,14 @@ void main() {
     actions = FakeActions();
     saved = [];
     discordTransfers.clear();
+    savePairing = null;
     host = TvRemoteHost(
       actions: actions,
       id: 'tv-1',
       name: '客廳電視',
       port: 0,
       discoveryPort: 0,
+      onPairedChanged: (phones) async => savePairing?.call(phones),
       onDiscordCredentials: (token, name) async {
         discordTransfers.add((token, name));
         return null;
@@ -178,16 +181,25 @@ void main() {
     expect(discordTransfers, [('fake-discord-credential', 'Test user')]);
     final credential = client.device!.token;
     client.disconnect();
-    final socket = await WebSocket.connect('ws://127.0.0.1:${host.boundPort}/remote/ws');
+    final socket =
+        await WebSocket.connect('ws://127.0.0.1:${host.boundPort}/remote/ws');
     final messages = StreamIterator(socket);
-    addTearDown(() async { await messages.cancel(); await socket.close(); });
-    socket.add(jsonEncode({'t': 'hello', 'id': 'phone-1', 'name': 'Pixel', 'token': credential}));
+    addTearDown(() async {
+      await messages.cancel();
+      await socket.close();
+    });
+    socket.add(jsonEncode(
+        {'t': 'hello', 'id': 'phone-1', 'name': 'Pixel', 'token': credential}));
     expect(await messages.moveNext(), isTrue);
     final welcome = jsonDecode(messages.current as String) as Map;
     expect(welcome['t'], 'welcome');
     await messages.moveNext(); // initial playback state
-    final encrypted = await DiscordTransfer.seal('second-fake-credential', 'Test user',
-        welcome['discord_key'], welcome['discord_challenge'], 'tv-1:phone-1:$credential');
+    final encrypted = await DiscordTransfer.seal(
+        'second-fake-credential',
+        'Test user',
+        welcome['discord_key'],
+        welcome['discord_challenge'],
+        'tv-1:phone-1:$credential');
     socket.add(jsonEncode({'t': 'discord', ...encrypted}));
     await messages.moveNext();
     expect((jsonDecode(messages.current as String) as Map)['ok'], isTrue);
@@ -354,6 +366,38 @@ void main() {
     final again = phone();
     await again.connect(tv);
     await until(() => again.phase == TvRemotePhase.pairing);
+  });
+
+  test('removing a phone while pairing is saved prevents late authorization',
+      () async {
+    final saving = Completer<void>();
+    final release = Completer<void>();
+    savePairing = (phones) async {
+      if (phones.isNotEmpty) {
+        saving.complete();
+        await release.future;
+      }
+    };
+    final client = phone();
+    await client.connect(tv);
+    await until(() => client.phase == TvRemotePhase.pairing);
+    client.submitPin(actions.pairings.last.pin);
+    await saving.future;
+    await host.forget('phone-1');
+    release.complete();
+    await until(() => client.connected || client.phase == TvRemotePhase.failed);
+    expect(client.connected, isFalse);
+    expect(actions.connections, isEmpty);
+    expect(host.paired, isEmpty);
+  });
+
+  test('stop during startup cannot leave a listening host behind', () async {
+    await host.stop();
+    final starting = host.start();
+    await host.stop();
+    await starting;
+    expect(host.running, isFalse);
+    expect(host.discoveryBoundPort, 0);
   });
 
   test('瀏覽器來的一律擋掉; /remote/info 報上名字', () async {

@@ -180,7 +180,9 @@ class DiscordPresence extends ChangeNotifier {
 
   Future<void> forget(
       {AgpClient? client, bool remote = false, bool bestEffort = false}) async {
+    final generation = _generation;
     if (remote && client != null) await client.deleteDiscordCredentials();
+    if (generation != _generation || _disposed) return;
     ++_generation;
     gateway.setToken('');
     _token = '';

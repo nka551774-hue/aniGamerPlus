@@ -26,6 +26,34 @@ import 'http_range.dart';
 /// waiting: 伺服器上還沒有這一集, 已經幫它排了一個任務, 檔案出現才開始抓.
 enum DownloadStatus { waiting, queued, running, paused, done, failed }
 
+final _downloadIdPattern = RegExp(r'[A-Za-z0-9_-]{1,128}');
+
+bool _validDownloadId(String value) {
+  final match = _downloadIdPattern.matchAsPrefix(value);
+  return match != null && match.end == value.length;
+}
+
+String _checkedDownloadId(String value) {
+  if (!_validDownloadId(value)) {
+    throw const FormatException('影片識別碼無效');
+  }
+  return value;
+}
+
+final _nativeResolutionPattern = RegExp(r'[1-9][0-9]*');
+
+bool _nativeFileNameMatches(String sn, String value) {
+  if (!_validDownloadId(sn)) return false;
+  if (value == '$sn.mp4') return true;
+  final prefix = '$sn-';
+  const suffix = 'p.mp4';
+  if (!value.startsWith(prefix) || !value.endsWith(suffix)) return false;
+  final resolution =
+      value.substring(prefix.length, value.length - suffix.length);
+  final match = _nativeResolutionPattern.matchAsPrefix(resolution);
+  return match != null && match.end == resolution.length;
+}
+
 /// 下載完之後隔多久回頭問一次彈幕. 伺服器是收到請求才開始生 .ass, 生完
 /// 之前一律 404 —— 所以第一次一定撲空.
 ///
@@ -115,8 +143,10 @@ class DownloadEntry {
     return value.isNaN ? 0 : value.clamp(0.0, 1.0);
   }
 
-  String get videoFileName =>
-      resolution > 0 ? '$sn-${resolution}p.mp4' : '$sn.mp4';
+  String get videoFileName {
+    final id = _checkedDownloadId(sn);
+    return resolution > 0 ? '$id-${resolution}p.mp4' : '$id.mp4';
+  }
 
   String get displayName => animeName.isNotEmpty ? animeName : title;
 
@@ -200,6 +230,7 @@ class DownloadStore extends ChangeNotifier {
   Directory? _dir;
   final Map<String, DownloadEntry> _entries = {};
   final Map<String, _Job> _jobs = {};
+  final Map<String, Future<void>> _removing = {};
   int _concurrency = 1;
   int get concurrency => _concurrency;
   set concurrency(int value) {
@@ -288,7 +319,7 @@ class DownloadStore extends ChangeNotifier {
         if (list is List) {
           for (final raw in list.whereType<Map>()) {
             final entry = DownloadEntry.fromJson(raw.cast<String, dynamic>());
-            if (entry.sn.isEmpty) continue;
+            if (!_validDownloadId(entry.sn)) continue;
             // 上一輪是被系統殺掉的, 不會有人幫它把狀態寫回去.
             // 原生傳輸的話可能其實還在背景跑, _attachNative 會再把它接回來.
             if (entry.status == DownloadStatus.running) {
@@ -339,9 +370,11 @@ class DownloadStore extends ChangeNotifier {
   File partFile(DownloadEntry entry) =>
       File('${directory.path}/${entry.videoFileName}.part');
 
-  File danmakuFile(String sn) => File('${directory.path}/$sn.ass');
+  File danmakuFile(String sn) =>
+      File('${directory.path}/${_checkedDownloadId(sn)}.ass');
 
-  File thumbFile(String sn) => File('${directory.path}/$sn.jpg');
+  File thumbFile(String sn) =>
+      File('${directory.path}/${_checkedDownloadId(sn)}.jpg');
 
   /// 播放器問的就是這一支: 有本機檔就別走網路
   File? localVideo(String sn) {
@@ -352,11 +385,13 @@ class DownloadStore extends ChangeNotifier {
   }
 
   File? localDanmaku(String sn) {
+    if (!_validDownloadId(sn)) return null;
     final file = danmakuFile(sn);
     return file.existsSync() ? file : null;
   }
 
   File? localThumb(String sn) {
+    if (!_validDownloadId(sn)) return null;
     final file = thumbFile(sn);
     return file.existsSync() ? file : null;
   }
@@ -420,6 +455,9 @@ class DownloadStore extends ChangeNotifier {
     required bool withDanmaku,
     required DownloadStatus status,
   }) async {
+    _checkedDownloadId(video.sn);
+    final removing = _removing[video.sn];
+    if (removing != null) await removing;
     final existing = _entries[video.sn];
     if (existing != null && existing.playable) return existing;
     if (existing != null && _jobs.containsKey(video.sn)) return existing;
@@ -486,6 +524,18 @@ class DownloadStore extends ChangeNotifier {
   }
 
   Future<void> remove(String sn, {bool deleteFiles = true}) async {
+    final pending = _removing[sn];
+    if (pending != null) return pending;
+    final removing = _remove(sn, deleteFiles: deleteFiles);
+    _removing[sn] = removing;
+    try {
+      await removing;
+    } finally {
+      if (identical(_removing[sn], removing)) _removing.remove(sn);
+    }
+  }
+
+  Future<void> _remove(String sn, {required bool deleteFiles}) async {
     // Remove from the queue before awaiting cancellation; _run's finally must
     // not start another copy while this deletion is waiting for the file sink.
     final entry = _entries.remove(sn);
@@ -513,7 +563,7 @@ class DownloadStore extends ChangeNotifier {
     }
     // 暫停時原生那邊留的續傳資料 (抓到一半的那一段在系統手上, 不在 .part 裡)
     if (entry != null && _native != null) {
-      unawaited(_native.discard(entry.videoFileName).catchError((Object _) {}));
+      await _native.discard(entry.videoFileName).catchError((Object _) {});
     }
     await _save();
     notifyListeners();
@@ -1006,7 +1056,9 @@ class DownloadStore extends ChangeNotifier {
         unawaited(() async {
           try {
             await native.cancel(task.sn);
-            if (task.fileName.isNotEmpty) await native.discard(task.fileName);
+            if (_nativeFileNameMatches(task.sn, task.fileName)) {
+              await native.discard(task.fileName);
+            }
           } catch (_) {}
         }());
         continue;
@@ -1052,7 +1104,8 @@ class DownloadStore extends ChangeNotifier {
     final entry = _entries[result.sn];
     if (entry == null) {
       // 那一集已經被刪了, 檔案別留著佔空間
-      if (result.status == TransferStatus.done && result.fileName.isNotEmpty) {
+      if (result.status == TransferStatus.done &&
+          _nativeFileNameMatches(result.sn, result.fileName)) {
         try {
           final orphan = File('${directory.path}/${result.fileName}');
           if (await orphan.exists()) await orphan.delete();
@@ -1223,7 +1276,7 @@ class DownloadStore extends ChangeNotifier {
 
   File? _danmakuCacheFile(String sn) {
     final dir = _danmakuCache;
-    if (dir == null) return null;
+    if (dir == null || !_validDownloadId(sn)) return null;
     return File('${dir.path}/$sn.ass');
   }
 

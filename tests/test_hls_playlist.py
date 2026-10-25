@@ -430,6 +430,20 @@ def test_key_route_serves_the_key_only_while_downloading(client, temp_dir):
     assert response.headers['Cache-Control'] == 'no-store'
 
 
+def test_key_route_never_serves_a_partially_written_aes_key(client, temp_dir):
+    Config.tasks_progress_rate[int(SN)] = {
+        'rate': 1.0, 'filename': '《x》', 'status': '正在下載'}
+    write_playlist(temp_dir, remote_playlist(1))
+    write_chunks(temp_dir, [0])
+    with open(str(temp_dir / 'key.m3u8key'), 'wb') as f:
+        f.write(b'partial')
+
+    response = client.get('/hls/key.bin?id=' + SN)
+
+    assert response.status_code == 404
+    assert response.json()['error'] == 'key not ready'
+
+
 @pytest.mark.parametrize('route', ['status.json', 'playlist.m3u8', 'key.bin', 'segment.ts'])
 def test_every_stream_route_rejects_a_non_numeric_sn(client, route):
     assert client.get('/hls/%s?id=../../etc/passwd' % route).status_code == 400

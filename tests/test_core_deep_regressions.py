@@ -19,7 +19,9 @@ import requests
 
 import Anime as anime_module
 import aniGamerPlus as agp
+import Catalog
 import Danmu as danmu_module
+import Loginer
 
 
 @pytest.fixture
@@ -274,6 +276,101 @@ def test_separate_episode_instances_share_one_download_lock(monkeypatch):
     with ThreadPoolExecutor(max_workers=8) as pool:
         list(pool.map(work, range(8)))
     assert peak == 1
+
+
+def test_telegram_failure_never_logs_bot_token_or_chat_id(public_anime,
+                                                           monkeypatch):
+    anime = public_anime
+    output = Path(anime._bangumi_dir) / 'episode.mp4'
+
+    def publish(_resolution):
+        output.write_bytes(b'published video')
+        anime.local_video_path = str(output)
+        anime._video_filename = output.name
+        anime.video_size = 1
+        anime.download_succeeded = True
+
+    anime._Anime__segment_download_mode = publish
+    anime._settings.update({
+        'telebot_notify': True,
+        'telebot_token': 'offline-secret-bot-token',
+        'telebot_use_chat_id': True,
+        'telebot_chat_id': 'offline-secret-chat-id',
+    })
+    monkeypatch.setattr(
+        anime_module.requests, 'post',
+        lambda *a, **k: (_ for _ in ()).throw(RuntimeError('offline')))
+    logs = []
+    monkeypatch.setattr(anime_module, 'err_print',
+                        lambda *a, **k: logs.append(' '.join(map(str, a))))
+
+    anime.download()
+
+    rendered = '\n'.join(logs)
+    assert 'offline-secret-bot-token' not in rendered
+    assert 'offline-secret-chat-id' not in rendered
+
+
+def test_ftp_upload_does_not_change_process_wide_socket_timeout(
+        public_anime, monkeypatch, tmp_path):
+    anime = public_anime
+    video = tmp_path / 'episode.mp4'
+    video.write_bytes(b'fixture')
+    anime.local_video_path = str(video)
+    anime._video_filename = video.name
+    anime._settings['ftp'] = {
+        'tls': False, 'server': 'offline.invalid', 'port': 21,
+        'user': 'user', 'pwd': 'password', 'cwd': '',
+        'show_error_detail': False, 'max_retry_num': 0,
+    }
+
+    class OfflineFtp:
+        def connect(self, *args, **kwargs):
+            raise RuntimeError('offline')
+
+    monkeypatch.setattr(anime_module, 'FTP', OfflineFtp)
+    monkeypatch.setattr(
+        anime_module.socket, 'setdefaulttimeout',
+        lambda _timeout: (_ for _ in ()).throw(
+            AssertionError('must not mutate the process-wide socket timeout')))
+
+    assert anime.upload() is False
+
+
+def test_export_my_anime_stops_after_http_failure(monkeypatch, tmp_path, quiet):
+    calls = []
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(agp.Config, 'read_cookie', lambda: {'BAHARUNE': 'offline'})
+
+    def request(*args, **kwargs):
+        calls.append(True)
+        if len(calls) > 1:
+            raise AssertionError('HTTP failure must not start an unbounded page loop')
+        return types.SimpleNamespace(status_code=503, text='offline')
+
+    monkeypatch.setattr(agp, 'do_request', request)
+    agp.export_my_anime()
+    assert calls == [True]
+    assert not (tmp_path / 'my_anime.txt').exists()
+
+
+@pytest.mark.parametrize('value, expected', [
+    ('true', True), ('TRUE', True), ('1', True), ('yes', True),
+    ('false', False), ('FALSE', False), ('0', False), ('no', False),
+])
+def test_login_cli_boolean_arguments_are_parsed_by_value(value, expected):
+    assert Loginer._parse_bool_arg(value) is expected
+
+
+def test_login_cli_boolean_arguments_reject_ambiguous_values():
+    with pytest.raises(ValueError, match='true/false'):
+        Loginer._parse_bool_arg('definitely')
+
+
+def test_catalog_plain_text_decodes_named_and_numeric_html_entities():
+    assert Catalog.plain_text(
+        '<p>Tom &apos;N&apos; Jerry &#x1F600; &#39;ok&#39;&nbsp;</p>'
+    ) == "Tom 'N' Jerry 😀 'ok'"
 
 
 @pytest.mark.skipif(os.name != 'nt', reason='Windows ANSI CA path compatibility')

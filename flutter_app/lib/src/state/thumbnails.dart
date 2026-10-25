@@ -68,10 +68,30 @@ class _Gate {
 }
 
 class ThumbnailStore extends ChangeNotifier {
-  ThumbnailStore(this._client);
+  ThumbnailStore(this._client) : _serverScope = _client.baseUrl;
 
   final AgpClient _client;
   final http.Client _http = http.Client();
+  String _serverScope;
+
+  /// The server currently backing cache keys and manifest state.
+  ///
+  /// Widgets use this value to discard an already-rendered image when the
+  /// shared client switches servers, before the replacement image resolves.
+  String get serverScope => _client.baseUrl;
+
+  void _syncServer() {
+    if (_serverScope == _client.baseUrl) return;
+    _serverScope = _client.baseUrl;
+    _posters = const {};
+    _episodes = const {};
+    _extraPosters.clear();
+    _titlePosters.clear();
+    _posterLookups.clear();
+    _failed.clear();
+    _etag = '';
+    _loaded = false;
+  }
 
   /// animeSn -> 3:4 主視覺
   Map<String, String> _posters = const {};
@@ -90,6 +110,7 @@ class ThumbnailStore extends ChangeNotifier {
   }
 
   void seedCatalog(Iterable<CatalogItem> items) {
+    _syncServer();
     var changed = false;
     for (final item in items) {
       if (item.cover.isEmpty) continue;
@@ -107,7 +128,11 @@ class ThumbnailStore extends ChangeNotifier {
 
   static String _titleKey(String title) =>
       title.replaceAll(RegExp(r'\s+'), '').toLowerCase();
-  String? posterForTitle(String title) => _titlePosters[_titleKey(title)];
+  String? posterForTitle(String title) {
+    _syncServer();
+    return _titlePosters[_titleKey(title)];
+  }
+
   String _normalizeUrl(String url) {
     if (url.startsWith('//')) return 'https:$url';
     if (url.startsWith('/') && _client.hasServer) {
@@ -130,18 +155,24 @@ class ThumbnailStore extends ChangeNotifier {
   /// 抓過但失敗的, 這一輪不要再試. 不然每次重畫都會再打一次同一個 404.
   final Set<String> _failed = <String>{};
 
-  bool get isEmpty => _posters.isEmpty && _episodes.isEmpty;
+  bool get isEmpty {
+    _syncServer();
+    return _posters.isEmpty && _episodes.isEmpty;
+  }
 
   // ------------------------------------------------------------------ 清單
 
   Future<Directory> _supportDir() async =>
       _dir ??= await getApplicationSupportDirectory();
 
-  Future<File> _manifestFile() async =>
-      File('${(await _supportDir()).path}/thumbnails.json');
+  Future<File> _manifestFile(String server) async =>
+      File('${(await _supportDir()).path}/thumbnails-${_key(server)}.json');
 
-  Future<File> _etagFile() async =>
-      File('${(await _supportDir()).path}/thumbnails.etag');
+  Future<File> _etagFile(String server) async =>
+      File('${(await _supportDir()).path}/thumbnails-${_key(server)}.etag');
+
+  Future<File> _posterSourcesFile(String server) async =>
+      File('${(await _supportDir()).path}/poster-sources-${_key(server)}.json');
 
   Future<Directory> _covers() async {
     final cached = _coverDir;
@@ -154,15 +185,22 @@ class ThumbnailStore extends ChangeNotifier {
   /// 開機時叫一次: 把上次那份清單擺上去, 順便準備好目錄, 讓 cachedFile() 之後
   /// 都能同步回答 —— 熱的封面第一帧就該畫出來, 不能等一輪 await.
   Future<void> init() async {
+    _syncServer();
     if (_loaded) return;
+    final server = _serverScope;
     _loaded = true;
     try {
       await _covers();
-      final file = await _manifestFile();
-      if (file.existsSync()) _apply(jsonDecode(await file.readAsString()));
-      final extra = File('${(await _supportDir()).path}/poster-sources.json');
+      final file = await _manifestFile(server);
+      if (file.existsSync()) {
+        final decoded = jsonDecode(await file.readAsString());
+        if (server != _client.baseUrl) return;
+        _apply(decoded);
+      }
+      final extra = await _posterSourcesFile(server);
       if (extra.existsSync()) {
         final decoded = jsonDecode(await extra.readAsString());
+        if (server != _client.baseUrl) return;
         if (decoded is Map) {
           for (final entry in decoded.entries) {
             if (entry.value is String) {
@@ -171,8 +209,12 @@ class ThumbnailStore extends ChangeNotifier {
           }
         }
       }
-      final etag = await _etagFile();
-      if (etag.existsSync()) _etag = (await etag.readAsString()).trim();
+      final etag = await _etagFile(server);
+      if (etag.existsSync()) {
+        final value = (await etag.readAsString()).trim();
+        if (server != _client.baseUrl) return;
+        _etag = value;
+      }
     } catch (_) {
       // 壞掉就當作沒有, refresh() 會重抓
     }
@@ -185,10 +227,13 @@ class ThumbnailStore extends ChangeNotifier {
   /// 退化回 /thumbnail.webp, 不是在畫面上彈錯誤.
   Future<void> refresh() async {
     if (!_client.hasServer) return;
+    final server = _client.baseUrl;
     await init();
+    if (server != _client.baseUrl) return;
     try {
       final fresh =
           await _client.thumbnailManifest(_etag.isEmpty ? null : _etag);
+      if (server != _client.baseUrl) return;
       // 問得到伺服器就表示網路通了, 之前抓不到的那些再給一次機會 —— 離線時
       // 每一格都會失敗一次並記在黑名單裡, 不清掉的話回線上還是一片漸層
       _failed.clear();
@@ -204,7 +249,7 @@ class ThumbnailStore extends ChangeNotifier {
       notifyListeners();
       // 先讓畫面拿到新清單, 再把它存下來. 存這一步要等 —— unawaited 的話
       // 「下次開機還在」就變成跟關 app 的時間點賽跑.
-      await _saveManifest(body, fresh.etag);
+      await _saveManifest(server, body, fresh.etag);
     } catch (_) {
       // 沒清單就沒清單
     }
@@ -232,16 +277,18 @@ class ThumbnailStore extends ChangeNotifier {
     }
   }
 
-  Future<void> _saveManifest(String body, String etag) async {
+  Future<void> _saveManifest(String server, String body, String etag) async {
     try {
-      await (await _manifestFile()).writeAsString(body);
-      await (await _etagFile()).writeAsString(etag);
+      await (await _manifestFile(server)).writeAsString(body);
+      await (await _etagFile(server)).writeAsString(etag);
     } catch (_) {
       // 存不下就算了
     }
   }
 
   Future<void> clear() async {
+    _syncServer();
+    final server = _serverScope;
     _posters = const {};
     _episodes = const {};
     _extraPosters.clear();
@@ -250,11 +297,11 @@ class ThumbnailStore extends ChangeNotifier {
     _etag = '';
     _failed.clear();
     try {
-      final manifest = await _manifestFile();
+      final manifest = await _manifestFile(server);
       if (manifest.existsSync()) await manifest.delete();
-      final etag = await _etagFile();
+      final etag = await _etagFile(server);
       if (etag.existsSync()) await etag.delete();
-      final extra = File('${(await _supportDir()).path}/poster-sources.json');
+      final extra = await _posterSourcesFile(server);
       if (extra.existsSync()) await extra.delete();
       final covers = await _covers();
       if (covers.existsSync()) await covers.delete(recursive: true);
@@ -269,6 +316,7 @@ class ThumbnailStore extends ChangeNotifier {
 
   /// 這一集所屬作品的 animeSn. 清單裡沒有就回 null.
   String? animeSnOf(String sn) {
+    _syncServer();
     final row = _episodes[sn];
     if (row == null || row.isEmpty) return null;
     return row[0].isEmpty ? null : row[0];
@@ -276,6 +324,7 @@ class ThumbnailStore extends ChangeNotifier {
 
   /// 3:4 主視覺. sn 可以是 animeSn, 也可以是某一集的 videoSn.
   String? posterFor(String sn) {
+    _syncServer();
     final direct = _posters[sn] ?? _extraPosters[sn];
     if (direct != null && direct.isNotEmpty) return _normalizeUrl(direct);
     final animeSn = animeSnOf(sn);
@@ -286,6 +335,7 @@ class ThumbnailStore extends ChangeNotifier {
 
   /// 16:9 劇照. 沒有的話退回主視覺 —— 有圖比沒圖好, 比例交給 BoxFit.cover.
   String? stillFor(String sn) {
+    _syncServer();
     final row = _episodes[sn];
     if (row != null && row.length > 1 && row[1].isNotEmpty) {
       return _normalizeUrl(row[1]);
@@ -309,11 +359,12 @@ class ThumbnailStore extends ChangeNotifier {
     return file.existsSync() ? file : null;
   }
 
-  /// 伺服器那條路的快取. key 只用 sn, 不含 token —— 換帳號不該讓圖全部重抓.
+  /// 伺服器那條路的快取依伺服器與 sn 分開；換 token 仍能沿用同一台的圖.
   File? cachedServerThumb(String sn) {
     final dir = _coverDir;
     if (dir == null) return null;
-    final file = File('${dir.path}/${_key('thumb:$sn')}.img');
+    final file =
+        File('${dir.path}/${_key('thumb:${_client.baseUrl}:$sn')}.img');
     return file.existsSync() ? file : null;
   }
 
@@ -343,7 +394,7 @@ class ThumbnailStore extends ChangeNotifier {
   /// 就帶著封面) → 伺服器的 /thumbnail.webp. 最後那條最貴, 所以排最後.
   Future<File?> resolve(String sn,
           {bool poster = false, String? fallbackUrl}) =>
-      _dedupe('$sn:${poster ? 'p' : 's'}:$fallbackUrl',
+      _dedupe('${_client.baseUrl}:$sn:${poster ? 'p' : 's'}:$fallbackUrl',
           () => _resolve(sn, poster: poster, fallbackUrl: fallbackUrl));
 
   /// 直接給網址的那種 —— 片單卡片的 cover 本來就是動畫瘋 CDN 的網址, 不必
@@ -367,6 +418,8 @@ class ThumbnailStore extends ChangeNotifier {
   Future<File?> _resolve(String sn,
       {required bool poster, String? fallbackUrl}) async {
     if (_disposed) return null;
+    _syncServer();
+    final server = _client.baseUrl;
     // A missing manifest entry previously fell straight back to a landscape
     // video frame. Ask the existing series endpoint for the actual poster once.
     if (poster &&
@@ -377,7 +430,7 @@ class ThumbnailStore extends ChangeNotifier {
       try {
         final info = await _serverGate
             .run(() => _client.series(sn).timeout(const Duration(seconds: 12)));
-        if (_disposed) return null;
+        if (_disposed || server != _client.baseUrl) return null;
         if (info.cover.isNotEmpty) {
           final cover = _normalizeUrl(info.cover);
           _extraPosters[sn] = cover;
@@ -393,6 +446,7 @@ class ThumbnailStore extends ChangeNotifier {
         // Older/offline servers can still provide the ordinary fallback image.
       }
     }
+    if (server != _client.baseUrl) return null;
     for (final url in [urlFor(sn, poster: poster), fallbackUrl]) {
       if (url == null || url.isEmpty) continue;
       // 走 resolveUrl 而不是自己開一筆 _download: 同一部作品的每一集共用同一
@@ -401,20 +455,25 @@ class ThumbnailStore extends ChangeNotifier {
       // 一樣的, 於是好幾筆一起寫同一個 .part, 先改名的那個贏, 其他人的 rename
       // 失敗回 null, 然後那個網址被記進黑名單, 整部作品的封面這一輪就沒了.
       final file = await resolveUrl(url);
+      if (server != _client.baseUrl) return null;
       if (file != null) return file;
     }
-    final serverKey = 'thumb:$sn';
+    final serverKey = 'thumb:$server:$sn';
     if (_failed.contains(serverKey)) return null;
     final hit = cachedServerThumb(sn);
     if (hit != null) return hit;
     if (!_client.hasServer) return null;
     // 同一個 sn 的 poster 跟 still 兩條路會落在同一個檔名上, 也要合併
     return _dedupe(serverKey, () async {
-      final file = await _serverGate.run(() => _download(
-            _client.thumbnailUrl(sn).toString(),
-            _key(serverKey),
-            headers: _client.authHeaders,
-          ));
+      final file = await _serverGate.run(() {
+        if (server != _client.baseUrl) return Future<File?>.value(null);
+        return _download(
+          _client.thumbnailUrl(sn).toString(),
+          _key(serverKey),
+          headers: _client.authHeaders,
+        );
+      });
+      if (_disposed || server != _client.baseUrl) return null;
       if (file == null) _failed.add(serverKey);
       return file;
     });
@@ -479,13 +538,14 @@ class ThumbnailStore extends ChangeNotifier {
   }
 
   Future<void> _persistPosterSources() {
+    final server = _client.baseUrl;
     final body = jsonEncode(_extraPosters);
     final previous = _posterWrite;
     return _posterWrite = () async {
       try {
         await previous;
       } catch (_) {}
-      final file = File('${(await _supportDir()).path}/poster-sources.json');
+      final file = await _posterSourcesFile(server);
       final temp = File('${file.path}.tmp');
       await temp.writeAsString(body, flush: true);
       await temp.rename(file.path);

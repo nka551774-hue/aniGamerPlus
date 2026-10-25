@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 
@@ -254,6 +255,41 @@ void main() {
     await presence.forget(bestEffort: true);
     expect(presence.linked, isFalse);
     await expectLater(presence.forget(), throwsStateError);
+  });
+
+  test('late remote unlink cannot erase a newer account Discord credential',
+      () async {
+    SharedPreferences.setMockInitialValues({});
+    FlutterSecureStorage.setMockInitialValues({});
+    final started = Completer<void>();
+    final response = Completer<http.Response>();
+    final client = AgpClient(
+        baseUrl: 'https://server.invalid',
+        token: 'old-token',
+        httpClient: MockClient((request) {
+          started.complete();
+          return response.future;
+        }));
+    final presence = DiscordPresence(await Prefs.load(),
+        httpClient: MockClient(
+            (_) async => http.Response('{"username":"Test user"}', 200)));
+    addTearDown(() {
+      presence.dispose();
+      client.close();
+    });
+    await presence.useAccount(client.baseUrl, 'alice');
+    await presence.link('fake-alice-credential');
+    final deleting = presence.forget(client: client, remote: true);
+    await started.future;
+    // The presence scope may advance before the shared HTTP client is updated.
+    await presence.useAccount(client.baseUrl, 'bob');
+    await presence.link('fake-bob-credential');
+    response.complete(http.Response('{}', 200));
+    await deleting;
+    expect(presence.linked, isTrue);
+    await presence.useAccount(client.baseUrl, 'alice');
+    await presence.useAccount(client.baseUrl, 'bob');
+    expect(presence.linked, isTrue);
   });
 
   group('Gateway', () {

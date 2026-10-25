@@ -412,6 +412,7 @@ class AppState extends ChangeNotifier {
   final Set<String> _pendingWatchTimes = <String>{};
   bool _watchTimesLoaded = false;
   Timer? _watchTimesWrite;
+  Future<void> _watchTimesIo = Future<void>.value();
 
   Future<File> _watchTimesFile() async =>
       File('${(await _libraryDir()).path}/watch-times.json');
@@ -419,12 +420,17 @@ class AppState extends ChangeNotifier {
   /// 磁碟那份併回記憶體. 整支 app 只做一次 (換帳號時重來).
   Future<void> _loadCachedWatchTimes() async {
     if (_watchTimesLoaded) return;
+    final version = client.contextVersion;
     _watchTimesLoaded = true;
     Map<String, dynamic> raw;
     try {
+      await _watchTimesIo;
+      if (version != client.contextVersion) return;
       final file = await _watchTimesFile();
+      if (version != client.contextVersion) return;
       if (!file.existsSync()) return;
       final decoded = jsonDecode(await file.readAsString());
+      if (version != client.contextVersion) return;
       if (decoded is! Map) return;
       raw = decoded.cast<String, dynamic>();
     } catch (_) {
@@ -443,21 +449,36 @@ class AppState extends ChangeNotifier {
     watchTimes = merged;
   }
 
-  Future<void> _saveWatchTimes() async {
+  // Keep writes and account-reset deletions in order, including operations
+  // already handed to the OS when the account changes.
+  Future<void> _queueWatchTimesIo(
+      int version, Future<void> Function(File) action) {
+    return _watchTimesIo = _watchTimesIo.then((_) async {
+      if (version != client.contextVersion) return;
+      try {
+        final file = await _watchTimesFile();
+        if (version != client.contextVersion) return;
+        await action(file);
+      } catch (_) {
+        // A later update can retry without poisoning the I/O queue.
+      }
+    });
+  }
+
+  Future<void> _saveWatchTimes() {
     _watchTimesWrite?.cancel();
     _watchTimesWrite = null;
-    try {
-      final payload = <String, dynamic>{};
-      watchTimes.forEach((sn, value) {
-        payload[sn] = {
-          ...value.toJson(),
-          if (_pendingWatchTimes.contains(sn)) 'dirty': true,
-        };
-      });
-      await (await _watchTimesFile()).writeAsString(jsonEncode(payload));
-    } catch (_) {
-      // 寫不進去就算了, 下一次進度更新會再試一遍
-    }
+    final version = client.contextVersion;
+    final payload = <String, dynamic>{};
+    watchTimes.forEach((sn, value) {
+      payload[sn] = {
+        ...value.toJson(),
+        if (_pendingWatchTimes.contains(sn)) 'dirty': true,
+      };
+    });
+    return _queueWatchTimesIo(version, (file) async {
+      await file.writeAsString(jsonEncode(payload));
+    });
   }
 
   /// 進度每 10 秒就更新一次, 每次都寫檔太吵 —— 合併成一秒一次.
@@ -491,24 +512,31 @@ class AppState extends ChangeNotifier {
   /// 把離線 (或送出去失敗) 時記下的進度補給伺服器.
   Future<void> flushPendingWatchTimes() async {
     if (_pendingWatchTimes.isEmpty || !canSyncWatchTimes) return;
-    final sent = <String>[];
+    final version = client.contextVersion;
+    var changed = false;
     for (final sn in _pendingWatchTimes.toList()) {
+      if (version != client.contextVersion) return;
       final value = watchTimes[sn];
       if (value == null) {
-        sent.add(sn); // 已經被刪掉了, 這筆欠帳跟著銷掉
+        changed = _pendingWatchTimes.remove(sn) || changed;
         continue;
       }
       try {
         await client.setWatchTime(sn, value.time,
             ended: value.ended,
             duration: value.duration > 0 ? value.duration : null);
-        sent.add(sn);
+        if (version != client.contextVersion) return;
+        // The acknowledgement only covers the immutable value sent above.
+        // Progress recorded while the request was in flight still needs sync.
+        if (identical(watchTimes[sn], value)) {
+          changed = _pendingWatchTimes.remove(sn) || changed;
+        }
       } catch (_) {
+        if (version != client.contextVersion) return;
         // 這一筆還欠著, 下次再送 —— 但別因為一筆失敗就放掉後面的
       }
     }
-    if (sent.isEmpty) return;
-    _pendingWatchTimes.removeAll(sent);
+    if (!changed) return;
     await _saveWatchTimes();
   }
 
@@ -520,18 +548,16 @@ class AppState extends ChangeNotifier {
     watchTimes = const {};
     _pendingWatchTimes.clear();
     _watchTimesLoaded = false;
-    try {
-      final file = await _watchTimesFile();
-      if (version != client.contextVersion) return;
+    await _queueWatchTimesIo(version, (file) async {
       if (file.existsSync()) await file.delete();
-    } catch (_) {
-      // 刪不掉就算了, 下次登入時的合併頂多多幾筆別人的紀錄
-    }
+    });
   }
 
   Future<void> refreshWatchTimes() async {
+    final version = client.contextVersion;
     // 本機那份永遠先擺上去 —— 離線時它就是全部, 不能像以前那樣清成空的
     await _loadCachedWatchTimes();
+    if (version != client.contextVersion) return;
     // 伺服器沒在替我們存進度的話, 本機這份就是唯一的一份: 底下那段合併會把
     // 「伺服器上沒有」讀成「在別台裝置上刪掉了」, 而 user_control 關掉的伺服器
     // 對每一筆查詢都回空的 —— 於是每次重整都把整份進度清光.
@@ -543,9 +569,11 @@ class AppState extends ChangeNotifier {
     try {
       remote = await client.allWatchTimes();
     } catch (_) {
+      if (version != client.contextVersion) return;
       notifyListeners();
       return; // 抓不到就繼續用本機那份
     }
+    if (version != client.contextVersion) return;
     final merged = Map<String, WatchTime>.from(watchTimes);
     remote.forEach((sn, value) {
       // 還欠伺服器的那幾筆一律以本機為準: 伺服器手上那份正是舊的
@@ -641,10 +669,15 @@ class AppState extends ChangeNotifier {
   void watchTimesChanged() => notifyListeners();
 
   Future<void> forgetWatchTime(String sn) async {
+    final version = client.contextVersion;
+    final value = watchTimes[sn];
     try {
       await client.deleteWatchTime(sn);
     } catch (_) {
       // 伺服器沒收到也先把畫面更新掉, 下次同步會補回來
+    }
+    if (version != client.contextVersion || !identical(watchTimes[sn], value)) {
+      return;
     }
     final next = Map<String, WatchTime>.from(watchTimes)..remove(sn);
     watchTimes = next;

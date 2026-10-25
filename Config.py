@@ -400,7 +400,7 @@ def __update_settings(old_settings):  # 升级配置文件
         # 默认命令为一分钟后关机
         new_settings['user_command'] = 'shutdown -s -t 60'
 
-    if 'segment_download_max_retry' not in new_settings.keys():
+    if 'segment_max_retry' not in new_settings.keys():
         # v9.0 新增分段模式下, 分段重试次数
         new_settings['segment_max_retry'] = 8
 
@@ -463,14 +463,15 @@ def __update_settings(old_settings):  # 升级配置文件
     if 'audio_language_jpn' in new_settings.keys():
         del new_settings['audio_language_jpn']
 
-    if 'proxy' not in new_settings.keys() or 'proxies' in new_settings.keys():
-        # v20 删除链式代理功能
-        if new_settings['proxies']["1"]:
-            # 转移用户原有配置
-            new_settings['proxy'] = new_settings['proxies']["1"]
-        else:
-            new_settings['proxy'] = 'http://user:passwd@example.com:1000'
-        del new_settings['proxies']
+    legacy_proxies = new_settings.pop('proxies', None)
+    if legacy_proxies is not None:
+        # v20 删除链式代理功能，保留原本的第一組代理。
+        legacy_proxy = (legacy_proxies.get("1")
+                        if isinstance(legacy_proxies, dict) else None)
+        new_settings['proxy'] = (
+            legacy_proxy or 'http://user:passwd@example.com:1000')
+    elif 'proxy' not in new_settings:
+        new_settings['proxy'] = 'http://user:passwd@example.com:1000'
 
     if 'use_dashboard' not in new_settings.keys():
         # v20 上线 Web 控制台
@@ -1374,12 +1375,20 @@ def __atomic_write(path, text):
 
 
 def get_local_ip():
-    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    local_ip = '127.0.0.1'
+    s = None
     try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         s.connect(('8.8.8.8', 80))
         local_ip = s.getsockname()[0]
-    except:
-        local_ip.close()
+    except OSError:
+        try:
+            local_ip = socket.gethostbyname(socket.gethostname())
+        except OSError:
+            pass
+    finally:
+        if s is not None:
+            s.close()
     return local_ip
 
 
@@ -1447,6 +1456,19 @@ def rename_all_playlist():
                 __color_print(0, f"重新命名時發生錯誤 {old_path}: {e}", status=1, no_sn=True)
 
 
+def _mark_ended_sn_lines(lines, ended_sns):
+    """Comment only entries whose leading SN exactly matches an ended SN."""
+    ended = {str(int(sn)) for sn in ended_sns}
+    marked = []
+    for line in lines:
+        match = re.match(r'^\s*(\d+)(?=\s|$)', line)
+        if match and match.group(1) in ended:
+            marked.append("# Ended: " + line)
+        else:
+            marked.append(line)
+    return marked
+
+
 def check_sn_ended():
     # 檢查動漫是否在週期表上
     # 如果沒有就註釋掉
@@ -1487,10 +1509,9 @@ def check_sn_ended():
     try:
         # update sn_list
         __color_print(0, "更新sn_list", no_sn=True)
-        sn_list = open(sn_list_path, 'r').read().split('\n')
-        for index, value in enumerate(sn_list):
-            if any(str(nssn) in value for nssn in not_in_schedule_sn):
-                sn_list[index] = "# Ended: " + value
+        with open(sn_list_path, 'r', encoding='utf-8') as handle:
+            sn_list = handle.read().split('\n')
+        sn_list = _mark_ended_sn_lines(sn_list, not_in_schedule_sn)
         write_sn_list("\n".join(sn_list))
     except Exception as e:
         __color_print(0, '更新sn_list時發生異常: ' + str(e), status=1, no_sn=True)

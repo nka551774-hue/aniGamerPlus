@@ -93,10 +93,14 @@ List<ExportFile> exportFilesFor(
   for (final entry in entries) {
     final video = store.localVideo(entry.sn);
     if (video == null) continue;
-    var base = exportBaseName(entry);
-    if (!used.add(base.toLowerCase())) {
-      base = '$base-${entry.sn}';
-      used.add(base.toLowerCase());
+    final original = exportBaseName(entry);
+    var base = original;
+    var collision = 0;
+    while (!used.add(base.toLowerCase())) {
+      collision++;
+      final suffix = '-${entry.sn}${collision == 1 ? '' : '-$collision'}';
+      base =
+          '${_truncateUtf8(original, kExportNameMaxBytes - utf8.encode(suffix).length)}$suffix';
     }
     files.add(ExportFile(
       path: video.path,

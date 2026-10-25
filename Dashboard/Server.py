@@ -3734,7 +3734,11 @@ def hls_key(request: Request):
             data = f.read()
     except OSError:
         return JSONResponse({"error": "key not ready"}, status_code=404)
-    if not data:
+    # AES-128 keys are exactly 16 bytes.  A downloader writes this file while
+    # playback requests may arrive concurrently, so a merely non-empty read
+    # can expose a torn key and make the player cache a value that can never
+    # decrypt a segment.
+    if len(data) != 16:
         return JSONResponse({"error": "key not ready"}, status_code=404)
 
     if request.method == 'HEAD':
@@ -4043,7 +4047,21 @@ async def webtime(request: Request):
 
 def _webtime_blocking(reqdata, token):
     gettype = reqdata.get('type')
-    sn = reqdata.get('sn')
+    raw_sn = reqdata.get('sn')
+    sn = raw_sn.strip() if isinstance(raw_sn, str) else ''
+    # Plugin providers may use non-numeric video IDs, but mutation keys still
+    # need a small, non-empty scalar.  Without this check a malformed client
+    # can persist null, whitespace-only, container or arbitrarily large JSON
+    # keys into userdata.json.
+    has_invalid_sn = (
+        not sn or len(sn) > 128 or any(ord(char) < 0x20 for char in sn)
+    )
+    if gettype in ('set', 'del') and has_invalid_sn:
+        return _html_response(
+            '{"status":"400", "msg":"Invalid sn"}', status_code=400)
+    if gettype == 'get' and raw_sn is not None and has_invalid_sn:
+        return _html_response(
+            '{"status":"400", "msg":"Invalid sn"}', status_code=400)
     ended = str(reqdata.get('ended', "false")).lower() == "true"
     if gettype == 'set':
         def _apply(userdata):

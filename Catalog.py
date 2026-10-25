@@ -10,6 +10,7 @@ animeList.php 一页页爬.
 命令行下直接用 Config.bahamut_request 就行. 解析出了问题也能脱开服务器单测.
 """
 
+import html as html_lib
 import re
 from urllib.parse import urlencode
 
@@ -209,8 +210,10 @@ def plain_text(html):
         return ''
     text = _BREAK.sub('\n', str(html))
     text = _TAG.sub('', text)
-    text = text.replace('&nbsp;', ' ').replace('&amp;', '&')
-    text = text.replace('&lt;', '<').replace('&gt;', '>').replace('&quot;', '"')
+    # The upstream description also uses numeric and less-common named
+    # entities (for example apostrophes and emoji), not just the original
+    # five replacements.  Decode them all with the standard HTML table.
+    text = html_lib.unescape(text)
     return '\n'.join(line.strip() for line in text.split('\n')).strip()
 
 

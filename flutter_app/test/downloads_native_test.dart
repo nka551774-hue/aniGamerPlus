@@ -130,8 +130,8 @@ void main() {
     expect(start['allowCellular'], isTrue);
     expect(entry.status, DownloadStatus.running);
 
-    await fake.emit('download.progress',
-        {'sn': '100', 'received': 400, 'total': 1000});
+    await fake.emit(
+        'download.progress', {'sn': '100', 'received': 400, 'total': 1000});
     expect(entry.received, 400);
     expect(entry.total, 1000);
 
@@ -275,6 +275,18 @@ void main() {
     expect(store.entryFor('600'), isNull);
   });
 
+  test('背景快照的檔名不屬於同一集時不得丟掉續傳資料', () async {
+    fake.running = [
+      {'sn': '600', 'name': '601-1080p.mp4', 'received': 1, 'total': 2},
+    ];
+    store.dispose();
+    store = await boot();
+    await eventually(() => fake.argsOf('download.cancel').isNotEmpty);
+
+    expect(fake.argsOf('download.cancel').single['sn'], '600');
+    expect(fake.argsOf('download.discard'), isEmpty);
+  });
+
   test('刪掉一集時連原生的續傳資料一起丟', () async {
     final entry = await store.enqueue(video('700'), withDanmaku: false);
     await eventually(() => started(1));
@@ -286,5 +298,43 @@ void main() {
 
     expect(fake.argsOf('download.discard').single['name'], entry.videoFileName);
     expect(store.entryFor('700'), isNull);
+  });
+
+  test('orphan native result cannot delete a file outside downloads', () async {
+    final outside = File('${temp.path}/outside.mp4');
+    await outside.writeAsBytes([1, 2, 3]);
+    await fake.emit('download.result',
+        {'sn': '999', 'status': 'done', 'name': '../outside.mp4'});
+    await eventually(() => fake.argsOf('download.ack').isNotEmpty);
+    expect(await outside.exists(), isTrue);
+  });
+
+  test('orphan native result cannot delete another episode file', () async {
+    final other = File('${store.directory.path}/700-1080p.mp4');
+    await other.writeAsBytes([1, 2, 3]);
+    await fake.emit('download.result',
+        {'sn': '999', 'status': 'done', 'name': '700-1080p.mp4'});
+    await eventually(() => fake.argsOf('download.ack').isNotEmpty);
+    expect(await other.exists(), isTrue);
+  });
+
+  test('re-enqueue waits for the previous removal to discard resume data',
+      () async {
+    await store.enqueue(video('701'), withDanmaku: false);
+    await eventually(() => started(1));
+    final removing = store.remove('701');
+    await eventually(() => fake.argsOf('download.cancel').isNotEmpty);
+    final adding = store.enqueue(video('701'), withDanmaku: false);
+    await fake.emit('download.result', {'sn': '701', 'status': 'cancelled'});
+    await removing;
+    await adding;
+    await eventually(() => started(2));
+    final discard =
+        fake.calls.indexWhere((c) => c.method == 'download.discard');
+    final start =
+        fake.calls.lastIndexWhere((c) => c.method == 'download.start');
+    expect(discard, isNonNegative);
+    expect(start, greaterThan(discard));
+    expect(store.entryFor('701')?.status, DownloadStatus.running);
   });
 }

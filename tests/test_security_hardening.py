@@ -296,3 +296,31 @@ def test_invalid_video_resolution_uses_existing_video_instead_of_500(
     response = client.get('/get_video.mp4', params={'id': '123', 'res': resolution})
     assert response.status_code == 200
     assert response.content == b'test-video'
+
+
+@pytest.mark.parametrize('sn', [None, '', '   ', ['123'], 'x' * 129])
+def test_watch_time_set_rejects_missing_or_unbounded_video_ids(
+        client, settings, userdata, sn):
+    settings['dashboard']['user_control']['enabled'] = True
+    client.cookies.set('token', 'admintoken123')
+    payload = {'type': 'set', 'time': 3}
+    if sn is not None:
+        payload['sn'] = sn
+
+    response = client.post('/watch/time', json=payload)
+
+    assert response.status_code == 400
+    assert userdata['users'][0]['videotimes'] == {}
+
+
+def test_watch_time_set_accepts_bounded_plugin_video_ids(
+        client, settings, userdata):
+    settings['dashboard']['user_control']['enabled'] = True
+    client.cookies.set('token', 'admintoken123')
+
+    response = client.post('/watch/time', json={
+        'type': 'set', 'sn': 'plugin:series-1_episode.2', 'time': 3})
+
+    assert response.status_code == 200
+    assert userdata['users'][0]['videotimes'][
+        'plugin:series-1_episode.2']['time'] == 3

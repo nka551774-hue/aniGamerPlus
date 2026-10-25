@@ -123,8 +123,7 @@ abstract class CastBackend {
 }
 
 class CastController extends ChangeNotifier with WidgetsBindingObserver {
-  CastController({CastBackend? backend})
-      : _backendOverride = backend;
+  CastController({CastBackend? backend}) : _backendOverride = backend;
 
   /// 連線掉了之後, App 在前景等這麼久還沒接回來, 才算真的停止投放.
   ///
@@ -145,6 +144,7 @@ class CastController extends ChangeNotifier with WidgetsBindingObserver {
 
   Future<bool>? _boot;
   bool _ready = false;
+  bool _disposed = false;
   final List<StreamSubscription<Object?>> _subscriptions = [];
 
   /// SDK 起得來 (有 Google Play 服務、不是電視). 不然整個投放功能藏起來.
@@ -188,7 +188,7 @@ class CastController extends ChangeNotifier with WidgetsBindingObserver {
 
   /// 起 SDK. 只會真的做一次; 失敗了這次開機就不再試.
   Future<bool> warmUp() {
-    if (!supported || Device.tv) return Future<bool>.value(false);
+    if (_disposed || !supported || Device.tv) return Future<bool>.value(false);
     return _boot ??= _start();
   }
 
@@ -199,7 +199,7 @@ class CastController extends ChangeNotifier with WidgetsBindingObserver {
     } catch (_) {
       ok = false;
     }
-    if (!ok) return false;
+    if (!ok || _disposed) return false;
     final lifecycle = WidgetsBinding.instance.lifecycleState;
     _foreground = lifecycle == null || lifecycle == AppLifecycleState.resumed;
     WidgetsBinding.instance.addObserver(this);
@@ -243,7 +243,7 @@ class CastController extends ChangeNotifier with WidgetsBindingObserver {
 
   /// 連到 [device]. 真的連上 (或 20 秒內沒連上) 才回來.
   Future<bool> connect(CastDevice device) async {
-    if (!_ready) return false;
+    if (!_ready || _disposed) return false;
     if (deviceName != null && connecting == null) return true;
     final waiter = Completer<bool>();
     _connectWaiter = waiter;
@@ -257,6 +257,7 @@ class CastController extends ChangeNotifier with WidgetsBindingObserver {
     }
     final ok = await waiter.future
         .timeout(const Duration(seconds: 20), onTimeout: () => false);
+    if (_disposed) return false;
     if (_connectWaiter == waiter) _connectWaiter = null;
     if (connecting == device) {
       connecting = null;
@@ -403,6 +404,9 @@ class CastController extends ChangeNotifier with WidgetsBindingObserver {
     if (contentId == media.url.toString()) return true;
     final reported = Uri.tryParse(contentId);
     return reported != null &&
+        reported.scheme == media.url.scheme &&
+        reported.host == media.url.host &&
+        reported.port == media.url.port &&
         reported.path == media.url.path &&
         reported.queryParameters['id'] == media.sn &&
         reported.queryParameters['res'] == media.url.queryParameters['res'];
@@ -417,6 +421,14 @@ class CastController extends ChangeNotifier with WidgetsBindingObserver {
 
   @override
   void dispose() {
+    _disposed = true;
+    _ready = false;
+    media = null;
+    deviceName = null;
+    connecting = null;
+    final waiter = _connectWaiter;
+    if (waiter != null && !waiter.isCompleted) waiter.complete(false);
+    _connectWaiter = null;
     _lostTimer?.cancel();
     if (_observing) WidgetsBinding.instance.removeObserver(this);
     for (final subscription in _subscriptions) {
@@ -453,7 +465,8 @@ class GoogleCastBackend implements CastBackend {
       GoogleCastDiscoveryManager.instance.devicesStream.map((found) {
         _known
           ..clear()
-          ..addEntries(found.map((device) => MapEntry(device.deviceID, device)));
+          ..addEntries(
+              found.map((device) => MapEntry(device.deviceID, device)));
         return [
           for (final device in found)
             CastDevice(
@@ -530,15 +543,13 @@ class GoogleCastBackend implements CastBackend {
   }
 
   @override
-  Stream<double> get positions => GoogleCastRemoteMediaClient
-      .instance.playerPositionStream
-      .map((position) => position.inMilliseconds / 1000);
+  Stream<double> get positions =>
+      GoogleCastRemoteMediaClient.instance.playerPositionStream
+          .map((position) => position.inMilliseconds / 1000);
 
   @override
   Future<void> load(CastMedia media,
-      {required double startAt,
-      required bool autoplay,
-      required double rate}) {
+      {required double startAt, required bool autoplay, required double rate}) {
     final poster = media.poster;
     final seconds = media.duration;
     return GoogleCastRemoteMediaClient.instance.loadMedia(

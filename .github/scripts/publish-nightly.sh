@@ -19,26 +19,47 @@
 
 set -euo pipefail
 
+if (( $# < 3 )); then
+  echo 'Usage: publish-nightly.sh <component> <summary> <file>...' >&2
+  exit 2
+fi
 TAG=nightly
 component=$1
 summary=$2
 shift 2
 
-# Move the tag to this run's commit. The tag only says where the most recent
-# publish came from; each component's own commit is in the notes.
-git tag -f "${TAG}" "${GITHUB_SHA}"
-git push -f origin "refs/tags/${TAG}"
+[[ "$component" =~ ^[A-Za-z][A-Za-z0-9_-]*$ ]] || { echo 'Invalid component' >&2; exit 2; }
+: "${GITHUB_SHA:?}" "${GITHUB_SERVER_URL:?}" "${GITHUB_REPOSITORY:?}" "${GITHUB_RUN_ID:?}"
+[[ "$GITHUB_SHA" =~ ^[0-9a-fA-F]{40}$ ]] || { echo 'Invalid commit' >&2; exit 2; }
+for artifact in "$@"; do
+  [[ -f "$artifact" && -s "$artifact" ]] || { echo "Missing or empty artifact: $artifact" >&2; exit 1; }
+done
 
-if ! gh release view "${TAG}" >/dev/null 2>&1; then
+# Read the current notes before publishing anything. A network/authentication
+# failure is not evidence that the release is absent and must not erase notes.
+body_file=$(mktemp)
+error_file=$(mktemp)
+notes_file=$(mktemp)
+trap 'rm -f -- "$body_file" "$error_file" "$notes_file"' EXIT
+if ! gh api "repos/${GITHUB_REPOSITORY}/releases/tags/${TAG}" --jq '.body // ""' > "$body_file" 2> "$error_file"; then
+  if ! grep -q 'HTTP 404' "$error_file"; then
+    cat "$error_file" >&2
+    exit 1
+  fi
+  printf '%s\n' 'master 每次推送自動建置。檔名固定，下載網址不會變。' > "$body_file"
   gh release create "${TAG}" --prerelease --title "Nightly" \
-    --notes "master 每次推送自動建置，未經測試。檔名固定，下載網址不會變。"
+    --target "${GITHUB_SHA}" --notes-file "$body_file"
 fi
 
-gh release upload "${TAG}" "$@" --clobber
+gh release upload "${TAG}" --clobber -- "$@"
 
 # Replace this component's line in the notes, keep everything else.
 line="- **${component}**: ${summary} · $(date -u +'%Y-%m-%d %H:%M UTC') · ${GITHUB_SHA::7} · [run](${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID})"
-body=$(gh release view "${TAG}" --json body -q .body | grep -v -F -- "- **${component}**:" || true)
-printf '%s\n%s\n' "${body}" "${line}" > notes.md
-gh release edit "${TAG}" --prerelease --notes-file notes.md
-rm -f notes.md
+awk -v prefix="- **${component}**:" 'index($0, prefix) != 1' "$body_file" > "$notes_file"
+printf '%s\n' "$line" >> "$notes_file"
+gh release edit "${TAG}" --prerelease --notes-file "$notes_file"
+
+# Only move an existing tag once this component's artifacts and notes arrived.
+# Fixed-name asset replacement itself is not an atomic multi-file transaction.
+git tag -f "${TAG}" "${GITHUB_SHA}"
+git push -f origin "refs/tags/${TAG}"

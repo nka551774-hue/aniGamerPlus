@@ -6,6 +6,30 @@ import 'package:http/http.dart' as http;
 import 'package:http/testing.dart';
 
 void main() {
+  for (final method in ['PUT', 'DELETE']) {
+    test('late Discord $method response rejects a changed account', () async {
+      final started = Completer<void>();
+      final pending = Completer<http.Response>();
+      final client = AgpClient(
+          baseUrl: 'https://first.invalid',
+          token: 'old',
+          httpClient: MockClient((request) {
+            expect(request.method, method);
+            started.complete();
+            return pending.future;
+          }));
+      addTearDown(client.close);
+      final operation = method == 'PUT'
+          ? client.saveDiscordCredentials({'fake': 'ciphertext'})
+          : client.deleteDiscordCredentials();
+      final rejected = expectLater(operation, throwsA(isA<ApiException>()));
+      await started.future;
+      client.token = 'new';
+      pending.complete(http.Response('{}', 200));
+      await rejected;
+    });
+  }
+
   test('switching servers removes the old credential before the next request',
       () async {
     final requests = <http.Request>[];

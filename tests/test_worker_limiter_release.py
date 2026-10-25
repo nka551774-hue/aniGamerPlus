@@ -228,3 +228,27 @@ def test_update_db_tolerates_a_null_video_size(monkeypatch):
 
     assert written['status'] == 0
     assert locker.acquire(blocking=False)
+
+
+def test_information_failure_releases_thread_limiter(monkeypatch, isolated_limiters):
+    """資訊查詢在 Anime 建立失敗時也不能永久吃掉下載名額。"""
+    monkeypatch.setattr(agp, 'build_anime',
+                        lambda _sn: {'failed': True, 'anime': None})
+
+    with pytest.raises(SystemExit):
+        getattr(agp, '__get_info_only')(51260)
+
+    assert isolated_limiters.thread.acquire(blocking=False), (
+        '資訊查詢失敗後 thread_limiter 的名額被漏掉了')
+
+
+def test_danmu_setup_failure_releases_thread_limiter(monkeypatch,
+                                                       isolated_limiters):
+    """彈幕工作在讀取設定前段失敗時也必須歸還名額。"""
+    monkeypatch.setattr(agp, 'settings', {})
+
+    with pytest.raises(KeyError):
+        getattr(agp, '__get_danmu_only')(51261, 'Series', __file__)
+
+    assert isolated_limiters.thread.acquire(blocking=False), (
+        '彈幕工作失敗後 thread_limiter 的名額被漏掉了')

@@ -920,62 +920,67 @@ def __download_only(sn, dl_resolution='', dl_save_dir='', realtime_show_file_siz
 
 def __get_info_only(sn):
     thread_limiter.acquire()
+    try:
+        anime = build_anime(sn)
+        if anime['failed']:
+            sys.exit(1)
+        anime = anime['anime']
+        anime.set_resolution(resolution)
+        anime.get_info()
+        download_dir = settings['bangumi_dir']
+        if classify:  # 控制是否建立番剧文件夹
+            download_dir = os.path.join(
+                download_dir, Config.legalize_filename(anime.get_bangumi_name()))
 
-    anime = build_anime(sn)
-    if anime['failed']:
-        sys.exit(1)
-    anime = anime['anime']
-    anime.set_resolution(resolution)
-    anime.get_info()
-    download_dir = settings['bangumi_dir']
-    if classify:  # 控制是否建立番剧文件夹
-        download_dir = os.path.join(download_dir, Config.legalize_filename(anime.get_bangumi_name()))
-
-    if danmu:
-        if os.path.exists(download_dir):
-            full_filename = os.path.join(download_dir, anime.get_filename()).replace(
-                '.' + settings['video_filename_extension'], '.ass')
-            d = Danmu(sn, full_filename, Config.read_cookie())
-            d.download(settings['danmu_ban_words'])
-        else:
-            err_print(sn, '彈幕下載異常', '番劇資料夾不存在: ' + download_dir, status=1)
-
-    thread_limiter.release()
+        if danmu:
+            if os.path.exists(download_dir):
+                full_filename = os.path.join(download_dir, anime.get_filename()).replace(
+                    '.' + settings['video_filename_extension'], '.ass')
+                d = Danmu(sn, full_filename, Config.read_cookie())
+                d.download(settings['danmu_ban_words'])
+            else:
+                err_print(sn, '彈幕下載異常', '番劇資料夾不存在: ' + download_dir, status=1)
+    finally:
+        thread_limiter.release()
 
 
 def __get_danmu_only(sn, bangumi_name, video_path, display=True, track_progress=False):
     global danmu_tasks_counter
     thread_limiter.acquire()
-
-    download_dir = settings['bangumi_dir']
-    # 控制是否建立番剧文件夹
     try:
-        if classify:
+        download_dir = settings['bangumi_dir']
+        # 控制是否建立番剧文件夹
+        try:
+            if classify:
+                download_dir = os.path.join(download_dir, Config.legalize_filename(bangumi_name))
+        except NameError:
             download_dir = os.path.join(download_dir, Config.legalize_filename(bangumi_name))
-    except:
-        download_dir = os.path.join(download_dir, Config.legalize_filename(bangumi_name))
 
-    try:
-        if os.path.exists(download_dir):
-            d = Danmu(sn, video_path.replace('.' + settings['video_filename_extension'], '.ass'), Config.read_cookie())
-            d.download(settings['danmu_ban_words'], display=display)
-        else:
-            err_print(sn, '彈幕下載異常', '番劇資料夾不存在: ' + download_dir, status=1, display=False)
-    except Exception as e:
-        err_print(sn, '彈幕下載異常', '出現未知異常: ' + str(e), status=1)
-    # 彈幕下載冷却
-    if settings['danmu_download_cd'] > 0:
-        err_print("更新資訊", "彈幕下載冷卻 " + str(settings['danmu_download_cd']) + " 秒", no_sn=True, display=display)
-        time.sleep(settings['danmu_download_cd'])
-    
-    if track_progress:
-        danmu_tasks_counter -= 1
-        if danmu_tasks_counter % 30 == 0 and danmu_tasks_counter != 0:
-            err_print(0, "彈幕更新", "剩下 " + str(danmu_tasks_counter) + " 條彈幕待更新", no_sn=True)
-        elif danmu_tasks_counter == 0:
-            err_print(0, "彈幕更新", "成功更新所有的彈幕", status=2, no_sn=True)
+        try:
+            if os.path.exists(download_dir):
+                d = Danmu(sn, video_path.replace(
+                    '.' + settings['video_filename_extension'], '.ass'),
+                    Config.read_cookie())
+                d.download(settings['danmu_ban_words'], display=display)
+            else:
+                err_print(sn, '彈幕下載異常', '番劇資料夾不存在: ' + download_dir,
+                          status=1, display=False)
+        except Exception as e:
+            err_print(sn, '彈幕下載異常', '出現未知異常: ' + str(e), status=1)
+        # 彈幕下載冷却
+        if settings['danmu_download_cd'] > 0:
+            err_print("更新資訊", "彈幕下載冷卻 " + str(settings['danmu_download_cd']) + " 秒",
+                      no_sn=True, display=display)
+            time.sleep(settings['danmu_download_cd'])
 
-    thread_limiter.release()
+        if track_progress:
+            danmu_tasks_counter -= 1
+            if danmu_tasks_counter % 30 == 0 and danmu_tasks_counter != 0:
+                err_print(0, "彈幕更新", "剩下 " + str(danmu_tasks_counter) + " 條彈幕待更新", no_sn=True)
+            elif danmu_tasks_counter == 0:
+                err_print(0, "彈幕更新", "成功更新所有的彈幕", status=2, no_sn=True)
+    finally:
+        thread_limiter.release()
 
 
 def __cui(sn, cui_resolution, cui_download_mode, cui_thread_limit, ep_range,
@@ -1088,7 +1093,8 @@ def __cui(sn, cui_resolution, cui_download_mode, cui_thread_limit, ep_range,
                     a = threading.Thread(target=__get_info_only, args=(episode_dict[ep],))
                 else:
                     a = threading.Thread(target=__download_only,
-                                         args=(episode_dict[ep], cui_resolution, cui_save_dir, realtime_show_file_size))
+                                         args=(episode_dict[ep], cui_resolution, cui_save_dir,
+                                               realtime_show_file_size, classify))
                 a.daemon = True
                 thread_tasks.append(a)
                 a.start()
@@ -1127,7 +1133,8 @@ def __cui(sn, cui_resolution, cui_download_mode, cui_thread_limit, ep_range,
                     a = threading.Thread(target=__get_info_only, args=(sn,))
                 else:
                     a = threading.Thread(target=__download_only,
-                                         args=(sn, cui_resolution, cui_save_dir, realtime_show_file_size))
+                                         args=(sn, cui_resolution, cui_save_dir,
+                                               realtime_show_file_size, classify))
                 a.daemon = True
                 thread_tasks.append(a)
                 a.start()
@@ -1153,7 +1160,8 @@ def __cui(sn, cui_resolution, cui_download_mode, cui_thread_limit, ep_range,
                 a = threading.Thread(target=__get_info_only, args=(sn,))
             else:
                 a = threading.Thread(target=__download_only,
-                                     args=(sn, cui_resolution, cui_save_dir, realtime_show_file_size))
+                                     args=(sn, cui_resolution, cui_save_dir,
+                                           realtime_show_file_size, classify))
             a.daemon = True
             thread_tasks.append(a)
             a.start()
@@ -1335,6 +1343,7 @@ def export_my_anime():
                 break
         else:
             err_print(0, f"匯入我的動畫失敗，狀態碼{bahamygatherPage.status_code}", status=1, no_sn=True)
+            return
         page += 1
 
     with open("my_anime.txt", "w", encoding="utf-8") as f:

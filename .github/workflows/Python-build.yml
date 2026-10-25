@@ -17,6 +17,8 @@ jobs:
 
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -51,6 +53,8 @@ jobs:
 
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
 
       - name: Set up Python ${{ matrix.python }}
         uses: actions/setup-python@v5
@@ -63,14 +67,8 @@ jobs:
           pip install -r requirements.txt
           pip install pyinstaller
 
-      - name: Build Executable (Windows)
-        if: runner.os == 'Windows'
-        run: pyinstaller --noconfirm --distpath %cd%\ --onefile --console --icon %cd%\Dashboard\static\img\aniGamerPlus.ico --clean --add-data "%cd%;aniGamerPlus/" %cd%\aniGamerPlus.py
-        shell: cmd
-
-      - name: Build Executable (Linux)
-        if: runner.os == 'Linux'
-        run: pyinstaller --noconfirm --distpath ./ --onefile --console --clean --add-data "./:aniGamerPlus/" aniGamerPlus.py
+      - name: Build executable
+        run: python .github/scripts/build-executable.py
 
       - name: Upload Artifact (Windows)
         if: runner.os == 'Windows'

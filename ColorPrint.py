@@ -92,8 +92,9 @@ def err_print(sn, err_msg, detail='', status=0, no_sn=False, prefix='', display=
 
     if log_settings['save_logs']:
         logs_dir = os.path.join(Config.get_working_dir(), 'logs')
-        if not os.path.exists(logs_dir):
-            os.makedirs(logs_dir)
+        # Several download workers can emit their first line together.  The
+        # check-then-create form races and one worker can raise FileExistsError.
+        os.makedirs(logs_dir, exist_ok=True)
         log_path = os.path.join(logs_dir, datetime.now().strftime("%Y-%m-%d") + '.log')
         with open(log_path, 'a+', encoding='utf-8') as log:
             log.write(msg + '\n')

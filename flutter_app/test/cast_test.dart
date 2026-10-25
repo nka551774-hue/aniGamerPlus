@@ -30,6 +30,7 @@ class FakeCastBackend implements CastBackend {
   final _positions = StreamController<double>.broadcast();
 
   bool initOk = true;
+  Completer<bool>? initResult;
   int discoveryStarts = 0;
   int discoveryStops = 0;
   final loads = <({CastMedia media, double startAt, bool autoplay})>[];
@@ -43,7 +44,7 @@ class FakeCastBackend implements CastBackend {
   void position(double seconds) => _positions.add(seconds);
 
   @override
-  Future<bool> initialise() async => initOk;
+  Future<bool> initialise() async => initResult?.future ?? initOk;
   @override
   Stream<List<CastDevice>> get devices => _devices.stream;
   @override
@@ -186,6 +187,19 @@ void main() {
   });
   tearDown(() => CastController.supported = supported);
 
+  test('disposing Cast while SDK starts cannot subscribe after disposal',
+      () async {
+    final backend = FakeCastBackend()..initResult = Completer<bool>();
+    final cast = CastController(backend: backend);
+    addTearDown(backend.close);
+    final warming = cast.warmUp();
+    cast.dispose();
+    backend.initResult!.complete(true);
+    expect(await warming, isFalse);
+    expect(cast.available, isFalse);
+    expect(backend._sessions.hasListener, isFalse);
+  });
+
   group('CastController', () {
     late FakeCastBackend backend;
     late CastController cast;
@@ -270,6 +284,27 @@ void main() {
       expect(cast.playback, CastPlayback.playing);
     });
 
+    test('same episode path from another server is not the current Cast media',
+        () async {
+      await cast.warmUp();
+      backend.session('tv');
+      await pumpEventQueue();
+      await cast.load(_media, startAt: 0);
+      for (final url in [
+        'http://other/get_video.mp4?id=1&ct=T',
+        'https://server/get_video.mp4?id=1&ct=T',
+        'http://server:99/get_video.mp4?id=1&ct=T',
+      ]) {
+        backend.status(CastPlayback.playing, contentId: url);
+        await pumpEventQueue();
+        expect(cast.playback, CastPlayback.loading, reason: url);
+      }
+      backend.status(CastPlayback.playing,
+          contentId: 'http://server/get_video.mp4?ct=T&id=1');
+      await pumpEventQueue();
+      expect(cast.playback, CastPlayback.playing);
+    });
+
     test('斷線就把電視上那一集忘掉', () async {
       await cast.warmUp();
       backend.session('tv');
@@ -325,8 +360,8 @@ void main() {
     testWidgets('一直沒回來: 寬限期過了才放掉', (tester) async {
       final (backend, cast) = await start(tester);
       backend.session(null);
-      await tester.pump(
-          CastController.kSessionGrace - const Duration(seconds: 1));
+      await tester
+          .pump(CastController.kSessionGrace - const Duration(seconds: 1));
       expect(cast.connected, isTrue);
       await tester.pump(const Duration(seconds: 2));
       expect(cast.connected, isFalse);
@@ -334,8 +369,7 @@ void main() {
       expect(cast.media, isNull);
     });
 
-    testWidgets('在背景時不下定論 (iOS 會把 App 整個停下來), 回到前景才開始算',
-        (tester) async {
+    testWidgets('在背景時不下定論 (iOS 會把 App 整個停下來), 回到前景才開始算', (tester) async {
       final (backend, cast) = await start(tester);
       tester.binding.handleAppLifecycleStateChanged(AppLifecycleState.inactive);
       tester.binding.handleAppLifecycleStateChanged(AppLifecycleState.hidden);
@@ -347,8 +381,8 @@ void main() {
       tester.binding.handleAppLifecycleStateChanged(AppLifecycleState.hidden);
       tester.binding.handleAppLifecycleStateChanged(AppLifecycleState.inactive);
       tester.binding.handleAppLifecycleStateChanged(AppLifecycleState.resumed);
-      await tester.pump(
-          CastController.kSessionGrace - const Duration(seconds: 1));
+      await tester
+          .pump(CastController.kSessionGrace - const Duration(seconds: 1));
       expect(cast.connected, isTrue, reason: 'SDK 這時候才正要把 session 接回來');
       await tester.pump(const Duration(seconds: 2));
       expect(cast.connected, isFalse);
@@ -429,7 +463,8 @@ void main() {
           requests.add(request.url);
           switch (request.url.path) {
             case '/cast/ticket':
-              return reply({'ticket': 'T-${request.url.queryParameters['id']}'});
+              return reply(
+                  {'ticket': 'T-${request.url.queryParameters['id']}'});
             case '/video_list.json':
               return reply({
                 'videos': [
@@ -473,8 +508,8 @@ void main() {
     Future<void> open(WidgetTester tester) async {
       await tester.binding.setSurfaceSize(const Size(1000, 800));
       addTearDown(() => tester.binding.setSurfaceSize(null));
-      await tester.pumpWidget(
-          MaterialApp(home: WatchPage(state: state, sn: '1')));
+      await tester
+          .pumpWidget(MaterialApp(home: WatchPage(state: state, sn: '1')));
       for (var i = 0; i < 8; i++) {
         await tester.pump(const Duration(milliseconds: 100));
       }
@@ -485,8 +520,7 @@ void main() {
       await tester.pump(const Duration(seconds: 1));
     }
 
-    testWidgets('連著 Chromecast 時開播放頁: 這一集交給電視, 網址帶著投放票',
-        (tester) async {
+    testWidgets('連著 Chromecast 時開播放頁: 這一集交給電視, 網址帶著投放票', (tester) async {
       await boot(tester);
       await open(tester);
 
@@ -609,8 +643,7 @@ void main() {
       tester.binding.handleAppLifecycleStateChanged(AppLifecycleState.resumed);
     }
 
-    testWidgets('投放中切到背景: 電視播完直接接下一集, App 一直撐在背景',
-        (tester) async {
+    testWidgets('投放中切到背景: 電視播完直接接下一集, App 一直撐在背景', (tester) async {
       await boot(tester, twoEpisodes: true);
       await open(tester);
       backend.status(CastPlayback.playing, duration: 1400);
@@ -658,8 +691,7 @@ void main() {
       await leave(tester);
     });
 
-    testWidgets('投放中切到背景, 電視暫停了也還撐著; 最後一集播完就放手',
-        (tester) async {
+    testWidgets('投放中切到背景, 電視暫停了也還撐著; 最後一集播完就放手', (tester) async {
       await boot(tester);
       await open(tester);
       backend.status(CastPlayback.playing, duration: 1400);

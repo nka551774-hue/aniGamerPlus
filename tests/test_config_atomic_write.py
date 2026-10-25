@@ -16,8 +16,10 @@ Run with::
 
 import json
 import os
+import socket
 import threading
 import time
+from pathlib import Path
 
 import pytest
 
@@ -266,3 +268,53 @@ def test_write_failure_leaves_the_previous_file_intact(config_paths, monkeypatch
     leftovers = [name for name in os.listdir(os.path.dirname(str(sn_list)))
                  if name.endswith('.tmp')]
     assert leftovers == [], leftovers
+
+
+def test_config_migration_preserves_unlimited_segment_retries_and_missing_proxy(
+        config_paths, monkeypatch):
+    config, _ = config_paths
+    sample = json.loads(
+        (Path(Config.__file__).with_name('config-sample.json'))
+        .read_text(encoding='utf-8'))
+    sample['config_version'] = 18.3
+    sample['segment_max_retry'] = -1
+    sample.pop('proxy')
+    monkeypatch.setattr(Config, '__color_print', lambda *a, **k: None,
+                        raising=False)
+
+    getattr(Config, '__update_settings')(sample)
+    migrated = json.loads(config.read_text(encoding='utf-8'))
+
+    assert migrated['segment_max_retry'] == -1
+    assert migrated['proxy'] == 'http://user:passwd@example.com:1000'
+
+
+def test_get_local_ip_closes_socket_and_has_a_safe_fallback(monkeypatch):
+    class OfflineSocket:
+        closed = False
+
+        def connect(self, _address):
+            raise OSError('offline')
+
+        def close(self):
+            self.closed = True
+
+    fake = OfflineSocket()
+    monkeypatch.setattr(Config.socket, 'socket', lambda *a, **k: fake)
+    monkeypatch.setattr(Config.socket, 'gethostname', lambda: 'test-host')
+    monkeypatch.setattr(Config.socket, 'gethostbyname',
+                        lambda _name: '192.0.2.10')
+
+    assert Config.get_local_ip() == '192.0.2.10'
+    assert fake.closed
+
+
+def test_ended_sn_marking_matches_the_leading_sn_not_a_substring():
+    lines = ['12 all', '312 all', '# Ended: 12 all', '120 latest']
+
+    assert Config._mark_ended_sn_lines(lines, [12]) == [
+        '# Ended: 12 all',
+        '312 all',
+        '# Ended: 12 all',
+        '120 latest',
+    ]

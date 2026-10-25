@@ -246,22 +246,34 @@ def test_readers_never_see_empty_or_corrupt_during_writes(real_userdata_env):
         for _ in range(200):
             if stop.is_set():
                 break
+            # Windows can briefly deny a new open while os.replace() owns the
+            # destination with delete access.  That is an availability retry,
+            # not evidence that an empty or torn document was published.  Keep
+            # it tightly bounded so a sustained sharing failure still fails.
+            for attempt in range(20):
+                try:
+                    with open(path, 'r', encoding='utf-8') as f:
+                        raw = f.read()
+                    break
+                except PermissionError as e:
+                    if attempt == 19:
+                        errors.append('read stayed unavailable: %s' % e)
+                        return
+                    time.sleep(0.005)
+                except OSError as e:
+                    errors.append('read error: %s' % e)
+                    return
+            if not raw.strip():
+                errors.append('empty file observed')
+                return
             try:
-                with open(path, 'r', encoding='utf-8') as f:
-                    raw = f.read()
-                if not raw.strip():
-                    errors.append('empty file observed')
-                    return
                 parsed = json.loads(raw)
-                users = parsed.get('users')
-                if not isinstance(users, list) or len(users) < 2:
-                    errors.append('users missing during concurrent write: %r' % (raw[:80],))
-                    return
             except json.JSONDecodeError as e:
                 errors.append('corrupt JSON observed: %s' % e)
                 return
-            except OSError as e:
-                errors.append('read error: %s' % e)
+            users = parsed.get('users')
+            if not isinstance(users, list) or len(users) < 2:
+                errors.append('users missing during concurrent write: %r' % (raw[:80],))
                 return
 
     wt = threading.Thread(target=writer)

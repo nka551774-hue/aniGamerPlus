@@ -3,4 +3,13 @@ version = 1
 name = "aniGamerPlus"
 
 [setup]
-script = "& d:\\aniGamerPlus\\.venv\\Scripts\\Activate.ps1"
+script = '''
+$ErrorActionPreference = 'Stop'
+if (-not (Test-Path -LiteralPath '.venv\Scripts\python.exe')) {
+    py -3.11 -m venv .venv
+    if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+}
+& '.\.venv\Scripts\python.exe' -m pip install -r requirements.txt -r requirements-dev.txt
+if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+. '.\.venv\Scripts\Activate.ps1'
+'''

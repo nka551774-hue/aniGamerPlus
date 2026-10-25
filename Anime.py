@@ -1288,32 +1288,34 @@ class Anime:
         if self._settings['telebot_notify']:
             try:
                 msg = '【aniGamerPlus消息】\n《' + self._video_filename + '》下载完成, 本集 ' + str(self.video_size) + ' MB'
-                vApiTokenTelegram = self._settings['telebot_token']
+                api_token = self._settings['telebot_token']
                 try:
                     if self._settings['telebot_use_chat_id'] and self._settings['telebot_chat_id']:  #手动指定发送目标
                         chat_id = self._settings['telebot_chat_id']
                     else:
-                        apiMethod = "getUpdates"
-                        api_url = "https://api.telegram.org/bot" + vApiTokenTelegram + "/" + apiMethod # Telegram bot api url
-                        response = self.__request_json(api_url)
-                        chat_id = response["result"][0]["message"]["chat"]["id"] # Get chat id
+                        api_url = f"https://api.telegram.org/bot{api_token}/getUpdates"
+                        response = requests.get(api_url, timeout=10)
+                        response.raise_for_status()
+                        chat_id = response.json()["result"][0]["message"]["chat"]["id"]
                     try:
-                        api_method = "sendMessage"
-                        req = "https://api.telegram.org/bot" \
-                                + vApiTokenTelegram \
-                                + "/" \
-                                + api_method \
-                                + "?chat_id=" \
-                                + str(chat_id) \
-                                + "&text=" \
-                                + str(msg)
-                        self.__request(req, no_cookies=True) # Send msg to telegram bot
-                    except:
-                        err_print(self._sn, 'TG NOTIFY ERROR', "Exception: Send msg error\nReq: " + req, status=1) # Send mag error
-                except:
-                    err_print(self._sn, 'TG NOTIFY ERROR', "Exception: Invalid access token\nToken: " + vApiTokenTelegram, status=1) # Cannot find chat id
+                        api_url = f"https://api.telegram.org/bot{api_token}/sendMessage"
+                        response = requests.post(
+                            api_url,
+                            data={'chat_id': str(chat_id), 'text': msg},
+                            timeout=10)
+                        response.raise_for_status()
+                    except Exception:
+                        # Requests exceptions include the full URL. The bot token
+                        # is part of that URL, so never echo the exception/request.
+                        err_print(self._sn, 'TG NOTIFY ERROR',
+                                  "Exception: Send msg error", status=1)
+                except Exception:
+                    err_print(self._sn, 'TG NOTIFY ERROR',
+                              "Exception: Invalid access token or chat target",
+                              status=1)
             except BaseException as e:
-                err_print(self._sn, 'TG NOTIFY ERROR', 'Exception: ' + str(e), status=1)
+                err_print(self._sn, 'TG NOTIFY ERROR',
+                          'Exception: Telegram notification failed', status=1)
 
         # 推送通知至 Discord
         if self._settings['discord_notify']:
@@ -1348,23 +1350,25 @@ class Anime:
                     err_print(self._sn, 'Plex auto Refresh ERROR', status=1)
             except Exception as e:
                 err_print(self._sn, 'Plex auto Refresh UNKNOWN ERROR', 'Exception: ' + str(e), status=1)
-        def m3u8(dir, name, title):
-            filepath = os.path.join(dir, Config.legalize_filename(self._bangumi_name) + '.m3u8')
+        def m3u8(directory, name, title):
+            filepath = os.path.join(directory, Config.legalize_filename(self._bangumi_name) + '.m3u8')
             if os.path.isfile(filepath):
                 err_print(self._sn, '下載狀態', '欲創建的m3u8已存在 ' + filepath, display=False)
             else:
-                f = open(filepath, "w")
-                f.write("#EXTM3U\n")
-                f.close()
-            f2 = open(filepath, "a")
-            f2.write("#EXTINF"+ ':-1,' + title + '\n' + name + '\n')
-            f2.close()
+                with open(filepath, "w", encoding='utf-8') as handle:
+                    handle.write("#EXTM3U\n")
+            with open(filepath, "a", encoding='utf-8') as handle:
+                handle.write("#EXTINF" + ':-1,' + title + '\n' + name + '\n')
         if self._settings['m3u8']:
             try:
                 m3u8(self._bangumi_dir, self._video_filename, self._title)
                 err_print(self._sn, 'M3U8 寫入成功')
-            except:
-                err_print(self._sn, 'M3U8 寫入失敗 ' + os.path.join(dir, Config.legalize_filename(self._bangumi_name) + '.m3u8'), 'M3U8 寫入失敗', status=1)
+            except Exception:
+                failed_path = os.path.join(
+                    self._bangumi_dir,
+                    Config.legalize_filename(self._bangumi_name) + '.m3u8')
+                err_print(self._sn, 'M3U8 寫入失敗 ' + failed_path,
+                          'M3U8 寫入失敗', status=1)
 
     def upload(self, bangumi_tag='', debug_file=''):
         first_connect = True  # 标记是否是第一次连接, 第一次连接会删除临时缓存目录
@@ -1379,8 +1383,6 @@ class Anime:
         if not self._video_filename:  # 用于仅上传, 将文件名提取出来
             self._video_filename = os.path.split(self.local_video_path)[-1]
 
-        socket.setdefaulttimeout(20)  # 超时时间20s
-
         if self._settings['ftp']['tls']:
             ftp = FTP_TLS()  # FTP over TLS
         else:
@@ -1392,8 +1394,13 @@ class Anime:
             connect_flag = False
             while err_counter <= 3:
                 try:
-                    ftp.connect(self._settings['ftp']['server'], self._settings['ftp']['port'])  # 连接 FTP
+                    ftp.connect(self._settings['ftp']['server'],
+                                self._settings['ftp']['port'], timeout=20)  # 连接 FTP
                     ftp.login(self._settings['ftp']['user'], self._settings['ftp']['pwd'])  # 登陆
+                    if self._settings['ftp']['tls']:
+                        # FTP_TLS only protects the control channel until
+                        # PROT P is requested; video data must be protected too.
+                        ftp.prot_p()
                     connect_flag = True
                     break
                 except ftplib.error_temp as e:

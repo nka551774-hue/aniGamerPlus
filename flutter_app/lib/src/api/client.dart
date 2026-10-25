@@ -635,18 +635,24 @@ class AgpClient {
   }
 
   Future<void> saveDiscordCredentials(Map<String, dynamic> value) async {
+    final version = _contextVersion;
     final request = http.Request('PUT', uri('/user/discord'))
       ..followRedirects = false
       ..headers.addAll({...authHeaders, 'Content-Type': 'application/json'})
       ..body = jsonEncode(value);
-    _check(await http.Response.fromStream(await _http.send(request)));
+    final response = await http.Response.fromStream(await _http.send(request));
+    _checkContext(version);
+    _check(response);
   }
 
   Future<void> deleteDiscordCredentials() async {
+    final version = _contextVersion;
     final request = http.Request('DELETE', uri('/user/discord'))
       ..followRedirects = false
       ..headers.addAll(authHeaders);
-    _check(await http.Response.fromStream(await _http.send(request)));
+    final response = await http.Response.fromStream(await _http.send(request));
+    _checkContext(version);
+    _check(response);
   }
 
   Future<void> logout() async {

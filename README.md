@@ -89,9 +89,11 @@ docker build -t anigamerplus .
 
 注意：
 
-1. confg.json 中的 Dashboard Host 請設定成 `0.0.0.0`，切勿設定 `127.0.0.1`.
-2. config.json 勿設定下載目錄 `bangumi_dir: ""`，請保持為空，以免目錄綁定失敗。
+1. config.json 中的 Dashboard Host 請設定成 `0.0.0.0`，讓容器的轉送埠能連到服務。
+2. config.json 的下載目錄請設為 `"bangumi_dir": ""`，使用預設 `/app/bangumi`，才能對應範例的下載目錄掛載。
 3. 可綁定 cookie.txt 至 `/app/cookie.txt`
+4. 範例中的 `config.json` 和 `aniGamer.db` 必須先是檔案。新安裝可複製 `config-sample.json` 並建立空的 `aniGamer.db`；不要讓 Docker 將不存在的來源路徑建立成目錄。
+5. 開放容器埠前，請啟用 `dashboard.user_control.enabled` 並設定自己的管理員密碼；舊的 `BasicAuth` 設定已不生效。
 
 使用：
 
@@ -210,7 +212,7 @@ docker run -td --name anigamerplus \
         "akamai": "1:65536;2:0;4:6291456;6:262144|15663105|0|m,a,s,p"  // 請求附帶akamai指紋，用於避免人機驗證
     },
     "use_proxy": false,  // 代理開關
-    "proxy": {"http://user:passwd@example.com:1000"},  // 代理配置
+    "proxy": "http://user:passwd@example.com:1000",  // 代理配置
     "upload_to_server": false,  // 上傳功能開關
     "ftp": {  // FTP配置
         "server": "",  // FTP Server IP
@@ -222,7 +224,7 @@ docker run -td --name anigamerplus \
         "show_error_detail": false,  // 是否顯示細節錯誤信息
         "max_retry_num": 15  // 最大重傳數, 支援續傳
     },
-    "user_command": "shutdown -s -t 60"  // 命令行模式使用 -u 參數有效, 在命令行模式下完成所有任務后執行的命令
+    "user_command": "shutdown -s -t 60",  // 命令行模式使用 -u 參數有效, 在命令行模式下完成所有任務后執行的命令
     "coolq_notify": false,  // 是否向酷Q推送下載完成訊息
     "coolq_settings": {
         "msg_argument_name": "message",
@@ -243,8 +245,8 @@ docker run -td --name anigamerplus \
     "read_config_when_checking_update": true,  // 是否在檢查更新時讀取配置文件, 開啓後對配置文件的更改將會在下次檢查時更新生效而不用重啓程序
     "check_sn_ended": false,  // 檢查更新時比對動畫瘋週期表, 不在表上且已下載完的動畫自動在 sn_list 中註釋為 "# Ended"
     "ads_time": 25,  // 非VIP廣告等待時間, 如果等待時間不足, 程式會自行追加時間 (最大20秒)
-    "mobile_ads_time": 25  // 使用移動端API解析的廣告等待時間
-    "use_dashboard": true  // Web 控制台開關
+    "mobile_ads_time": 25,  // 使用移動端API解析的廣告等待時間
+    "use_dashboard": true,  // Web 控制台開關
     "dashboard": {  // Web控制面板配置
         "host": "127.0.0.1",  // 監聽地址, 如果需要允許外部訪問, 請填寫 "0.0.0.0"
         "port": 5000,  // 監聽端口
@@ -266,7 +268,7 @@ docker run -td --name anigamerplus \
     },
     "save_logs": true,  // 是否記錄日志, 一天一個日志
     "quantity_of_logs": 7,  // 日志保留數量, 正整數值, 必須大於等於 1, 默認為 7
-    "config_version": 18.3,  // 配置文件版本
+    "config_version": 18.4,  // 配置文件版本
     "database_version": 2.0  // 資料庫版本
 }
 ```
@@ -583,7 +585,8 @@ Web 控制臺默認啓用, 默認端口 5000, 支援 SSL (https), 證書保存�
 
 如果想開放外部訪問, 可以將 ```dashboard``` 配置中的 ```host``` 設置成 ```0.0.0.0```
 
-支援使用 BasicAuth 進行認證, **注意**:warning: **用戶密碼是明文傳輸的, 如有需要建議同時啓用 SSL**.
+認證使用 `dashboard.user_control` 帳號系統；舊的 `BasicAuth`、`username`、`password` 欄位已停用。
+對外開放前請啟用帳號系統、修改預設管理員密碼，並以 HTTPS 保護登入資料。
 
 支援在 Web 控制臺下達手動任務(即命令行模式啓動的任務), 爲了控制臺輸出工整, 控制臺不會顯示下載進度.
 
@@ -597,9 +600,9 @@ Web 控制臺默認啓用, 默認端口 5000, 支援 SSL (https), 證書保存�
     "host": "127.0.0.1",  # 監聽地址, 如果需要允許外部訪問, 請填寫 "0.0.0.0"
     "port": 5000,  # 監聽端口
     "SSL": false,  # 是否開啓SSL
-    "BasicAuth": false,  # 是否使用 BasicAuth 進行認證
-    "username": "admin",  # BasicAuth 用戶名
-    "password": "admin",  # BasicAuth 密碼
+    "BasicAuth": false,  # 已停用，請使用 user_control
+    "username": "admin",  # 舊欄位，已停用
+    "password": "admin",  # 舊欄位，已停用
     "online_watch": false,  # 線上觀看開關
     "online_watch_requires_login": false,  # 線上觀看是否要求登入 (需開啟 user_control)
     "user_control": {  # 帳號系統

@@ -33,6 +33,16 @@ _FINGERPRINT_FIELD_XPATH = (
 _JA3_PATTERN = re.compile(r'^\d+,[\d-]*,[\d-]*,[\d-]*,[\d-]*$')
 _AKAMAI_PATTERN = re.compile(r'^\d+:\d+(?:;\d+:\d+)*\|\d+\|\d+\|[a-z,]+$', re.IGNORECASE)
 
+
+def _parse_bool_arg(value):
+    """Parse the documented CLI boolean instead of using bool(nonempty)."""
+    normalized = str(value).strip().lower()
+    if normalized in ('true', '1', 'yes', 'on'):
+        return True
+    if normalized in ('false', '0', 'no', 'off'):
+        return False
+    raise ValueError('boolean arguments must be true/false')
+
 # stolen from Config.py lol
 def __color_print(sn, err_msg, detail='', status=0, no_sn=False, display=True):
     # 避免与 ColorPrint.py 相互调用产生问题
@@ -73,7 +83,8 @@ def login(driver, username, password, save_cookie=False):
     driver.get("https://gamer.com.tw/")
     if os.path.exists('cookies.pkl'):
         __color_print(0, "登入狀態", detail='找到cookie檔案', no_sn=True)
-        cookies = pickle.load(open("cookies.pkl", "rb"))
+        with open("cookies.pkl", "rb") as cookie_file:
+            cookies = pickle.load(cookie_file)
         for cookie in cookies:
             driver.add_cookie(cookie)
     driver.get("https://user.gamer.com.tw/login.php")
@@ -121,7 +132,8 @@ def login(driver, username, password, save_cookie=False):
     __color_print(0, "登入狀態", detail='登入成功', no_sn=True, status=2)
     if save_cookie:
         __color_print(0, "登入狀態", detail='正在儲存cookie', no_sn=True)
-        pickle.dump(driver.get_cookies(), open("cookies.pkl", "wb"))
+        with open("cookies.pkl", "wb") as cookie_file:
+            pickle.dump(driver.get_cookies(), cookie_file)
     return True
 
 
@@ -220,7 +232,13 @@ if __name__ == "__main__":
     if len(sys.argv) < 5:
         print("Usage:", sys.argv[0], "[username] [password] [headless?] [save_cookie?]\nreturns raw cookie.\n? = [true/false]")
         exit(1)
-    stat = do_all(sys.argv[1], sys.argv[2], bool(sys.argv[3]), bool(sys.argv[4]))
+    try:
+        headless = _parse_bool_arg(sys.argv[3])
+        save_cookie = _parse_bool_arg(sys.argv[4])
+    except ValueError as error:
+        print("ERROR:", error, file=sys.stderr)
+        exit(2)
+    stat = do_all(sys.argv[1], sys.argv[2], headless, save_cookie)
     if stat:
         print(stat)
         exit(0)

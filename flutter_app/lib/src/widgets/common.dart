@@ -67,6 +67,7 @@ class _CoverImageState extends State<CoverImage> {
   int _request = 0;
   int _decodeRetries = 0;
   bool _loading = false;
+  String? _serverScope;
 
   /// 交給 ThumbnailStore 管的那種. 這種情況下不再掛 CachedNetworkImage ——
   /// 兩邊同時抓就等於繞過了閘門.
@@ -108,7 +109,8 @@ class _CoverImageState extends State<CoverImage> {
         oldWidget.name != widget.name ||
         oldWidget.file != widget.file ||
         oldWidget.poster != widget.poster ||
-        oldWidget.cache != widget.cache) {
+        oldWidget.cache != widget.cache ||
+        _serverScope != widget.cache?.serverScope) {
       _resolved = null;
       _asked = false;
       _request++;
@@ -119,6 +121,15 @@ class _CoverImageState extends State<CoverImage> {
 
   void _sync() {
     final cache = widget.cache;
+    final scope = cache?.serverScope;
+    if (_serverScope != scope) {
+      _serverScope = scope;
+      _resolved = null;
+      _asked = false;
+      _request++;
+      _decodeRetries = 0;
+      _loading = false;
+    }
     if (cache == null || !_managed) return;
     // 已經下載到手機的那一集有自己的縮圖檔, 不必再去要
     if (widget.file != null) return;
@@ -146,7 +157,7 @@ class _CoverImageState extends State<CoverImage> {
         ? cache.resolve(sn, poster: widget.poster, fallbackUrl: url)
         : cache.resolveUrl(url!, headers: widget.headers);
     unawaited(pending.then((file) {
-      if (!mounted || request != _request) return;
+      if (!mounted || request != _request || scope != cache.serverScope) return;
       setState(() {
         _loading = false;
         if (file != null) _resolved = file;
@@ -171,6 +182,7 @@ class _CoverImageState extends State<CoverImage> {
   }
 
   Widget _content(BuildContext context, int? cacheWidth) {
+    final request = _request;
     final ratio = widget.aspectRatio;
     final name = widget.name;
     final local = widget.file ?? _resolved;
@@ -210,9 +222,10 @@ class _CoverImageState extends State<CoverImage> {
                   errorBuilder: (context, error, stack) {
                     if (widget.file == null && _decodeRetries++ == 0) {
                       WidgetsBinding.instance.addPostFrameCallback((_) async {
+                        if (!mounted || request != _request) return;
                         await widget.cache?.invalidate(local);
                         await localImage.evict();
-                        if (!mounted) return;
+                        if (!mounted || request != _request) return;
                         setState(() {
                           _resolved = null;
                           _asked = false;

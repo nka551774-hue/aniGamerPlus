@@ -185,6 +185,27 @@ void main() {
           ['同名.mp4', '同名.ass', '同名-202.mp4', '同名-202.ass']);
     });
 
+    test('collision suffix cannot reuse another episode title', () async {
+      await seed([
+        {'sn': '200', 'title': '同名-202', 'hasDanmaku': true},
+        {'sn': '201', 'title': '同名', 'hasDanmaku': true},
+        {'sn': '202', 'title': '同名', 'hasDanmaku': true},
+      ]);
+      await boot();
+      final files = exportFilesFor(
+          store,
+          [
+            for (final sn in ['200', '201', '202']) store.entryFor(sn)!
+          ],
+          withDanmaku: true);
+      expect(
+          files.map((file) => file.name.toLowerCase()).toSet(), hasLength(6));
+      for (var i = 0; i < files.length; i += 2) {
+        expect(files[i].name.replaceFirst('.mp4', ''),
+            files[i + 1].name.replaceFirst('.ass', ''));
+      }
+    });
+
     Future<void> pumpLauncher(WidgetTester tester, {String? only}) async {
       await tester.pumpWidget(MaterialApp(
         home: Scaffold(

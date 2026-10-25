@@ -115,6 +115,8 @@ class TvRemoteHost extends ChangeNotifier {
   PairingRequest? _pairing;
   Timer? _pairingTimer;
   bool _disposed = false;
+  int _serverGeneration = 0;
+  Future<void>? _starting;
 
   /// 實際開在哪個埠. 固定的那個被佔走時是系統隨便給的一個
   int boundPort = 0;
@@ -153,14 +155,30 @@ class TvRemoteHost extends ChangeNotifier {
 
   // ------------------------------------------------------------------ 開關
 
-  Future<void> start() async {
-    if (_server != null) return;
+  Future<void> start() {
+    if (_disposed || _server != null) return Future<void>.value();
+    final pending = _starting;
+    if (pending != null) return pending;
+    final generation = ++_serverGeneration;
+    late final Future<void> starting;
+    starting = _start(generation).whenComplete(() {
+      if (identical(_starting, starting)) _starting = null;
+    });
+    return _starting = starting;
+  }
+
+  Future<void> _start(int generation) async {
     HttpServer server;
     try {
       server = await HttpServer.bind(InternetAddress.anyIPv4, port);
     } on SocketException {
+      if (_disposed || generation != _serverGeneration) return;
       // 固定的埠被佔走了: 隨便開一個. 廣播跟手動輸入照樣找得到, 只是掃不到
       server = await HttpServer.bind(InternetAddress.anyIPv4, 0);
+    }
+    if (_disposed || generation != _serverGeneration) {
+      await server.close(force: true);
+      return;
     }
     _server = server;
     boundPort = server.port;
@@ -172,6 +190,10 @@ class TvRemoteHost extends ChangeNotifier {
       final udp = await RawDatagramSocket.bind(
           InternetAddress.anyIPv4, discoveryPort,
           reuseAddress: true);
+      if (_disposed || generation != _serverGeneration) {
+        udp.close();
+        return;
+      }
       _udp = udp;
       udp.listen(
         (event) {
@@ -186,6 +208,8 @@ class TvRemoteHost extends ChangeNotifier {
   }
 
   Future<void> stop() async {
+    _serverGeneration++;
+    _starting = null;
     _endPairing();
     for (final session in _sessions.toList()) {
       session.helloTimer?.cancel();
@@ -343,6 +367,7 @@ class TvRemoteHost extends ChangeNotifier {
   }
 
   Future<void> _onMessage(_Session session, dynamic data) async {
+    if (!_sessions.contains(session) || _disposed) return;
     if (data is! String || data.length > _maxMessage) return;
     final Map<String, dynamic> message;
     try {
@@ -367,6 +392,11 @@ class TvRemoteHost extends ChangeNotifier {
       return;
     }
 
+    if (!_paired.contains(session.phone)) {
+      _fail(session, '電視上已經把這支手機移除了。');
+      return;
+    }
+
     switch (type) {
       case 'discord':
         final transfer = session.discordTransfer;
@@ -378,7 +408,8 @@ class TvRemoteHost extends ChangeNotifier {
         try {
           final value = await transfer.open(
               message, '$id:${session.phone!.id}:${session.phone!.token}');
-          if (!_sessions.contains(session) || !_paired.contains(session.phone)) {
+          if (!_sessions.contains(session) ||
+              !_paired.contains(session.phone)) {
             return;
           }
           error = await callback(value.token, value.name);
@@ -523,16 +554,24 @@ class TvRemoteHost extends ChangeNotifier {
     ];
     _endPairing();
     await onPairedChanged?.call(paired);
+    if (!_sessions.contains(session)) return;
+    if (!_paired.contains(phone)) {
+      _fail(session, '電視上已經把這支手機移除了。');
+      return;
+    }
     _send(session, {'t': 'paired', 'token': phone.token});
     await _authorize(session, phone);
   }
 
   Future<void> _authorize(_Session session, PairedPhone phone) async {
+    if (!_sessions.contains(session) || !_paired.contains(phone) || _disposed) {
+      return;
+    }
     session.helloTimer?.cancel();
     session.phone = phone;
     if (onDiscordCredentials != null) {
       session.discordTransfer = await DiscordTransfer.create();
-      if (!_sessions.contains(session)) return;
+      if (!_sessions.contains(session) || !_paired.contains(phone)) return;
     }
     final status = actions.status;
     _send(session, {

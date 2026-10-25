@@ -64,6 +64,24 @@ void main() {
     return entry;
   }
 
+  test('download IDs cannot escape the app download directory', () async {
+    for (final sn in ['../outside', r'..\outside', '/outside', 'a:b', '']) {
+      await expectLater(store.enqueue(VideoItem(sn: sn), withDanmaku: false),
+          throwsFormatException,
+          reason: sn);
+      expect(store.entryFor(sn), isNull);
+    }
+  });
+
+  test('online danmaku cache ignores IDs containing a path', () async {
+    const ass = '[Script Info]\nScriptType: v4.00+\n';
+    final outside = File('${temp.path}/outside.ass');
+    await store.writeCachedDanmaku('../outside', ass);
+    expect(await outside.exists(), isFalse);
+    await outside.writeAsString(ass);
+    expect(await store.readCachedDanmaku('../outside'), isNull);
+  });
+
   Future<void> run(DownloadEntry entry) async {
     store.concurrency = 1;
     for (var count = 0; count < 200; count++) {

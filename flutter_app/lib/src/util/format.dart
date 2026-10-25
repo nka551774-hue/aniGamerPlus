@@ -8,17 +8,16 @@ import 'package:flutter/material.dart';
 
 /// DJB2-ish, 跟 agp-shell.js 的 artFor() 逐字對應.
 int _hashOf(String name) {
-  var hash = 0;
-  for (final code in name.runes) {
+  var hash = 5381;
+  for (final code in name.codeUnits) {
     hash = ((hash << 5) + hash + code).toSigned(32);
   }
-  return hash;
+  return hash.abs();
 }
 
 /// 片名 -> 穩定的兩色漸層.
 LinearGradient artFor(String? name) {
-  final text = (name ?? '').trim();
-  final hash = _hashOf(text.isEmpty ? 'aniGamerPlus' : text);
+  final hash = _hashOf(name ?? '');
   final hue = (hash % 360).abs().toDouble();
   final hue2 = ((hue + 38 + (hash % 40).abs()) % 360).toDouble();
   return LinearGradient(
@@ -47,14 +46,11 @@ String initials(String? name) {
   final text = (name ?? '').trim();
   if (text.isEmpty) return '?';
   if (_hasCjk(text)) {
-    return text.length <= 2 ? text : text.substring(0, 2);
+    return text.characters.take(2).toString();
   }
   final words = text.split(RegExp(r'\s+')).where((w) => w.isNotEmpty).toList();
   if (words.isEmpty) return '?';
-  return words
-      .take(2)
-      .map((w) => w.substring(0, 1).toUpperCase())
-      .join();
+  return words.take(2).map((w) => w.characters.first.toUpperCase()).join();
 }
 
 /// 秒 -> 0:00 / 0:00:00
@@ -123,10 +119,12 @@ String episodeLabel(dynamic episode) {
   final text = (episode ?? '').toString().trim();
   if (text.isEmpty) return '單集';
   if (RegExp(r'^\d+(\.\d+)?$').hasMatch(text)) {
-    final value = double.parse(text);
-    final shown = value == value.roundToDouble()
-        ? value.round().toString()
-        : text;
+    // Episode metadata is text: converting through double can round an integer
+    // or overflow before rendering. Only normalize an all-zero fraction.
+    final parts = text.split('.');
+    final integral = parts.length == 1 || RegExp(r'^0+$').hasMatch(parts[1]);
+    final digits = parts[0].replaceFirst(RegExp(r'^0+'), '');
+    final shown = integral ? (digits.isEmpty ? '0' : digits) : text;
     return '第 $shown 集';
   }
   return text;

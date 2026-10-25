@@ -12,6 +12,7 @@ import 'dart:io';
 import 'package:agp_mobile/src/api/client.dart';
 import 'package:agp_mobile/src/api/models.dart';
 import 'package:agp_mobile/src/state/thumbnails.dart';
+import 'package:crypto/crypto.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:path_provider_platform_interface/path_provider_platform_interface.dart';
 
@@ -128,6 +129,9 @@ void main() {
   late AgpClient client;
   late ThumbnailStore store;
 
+  File manifestFile(String extension) => File(
+      '${temp.path}/thumbnails-${sha1.convert(utf8.encode(client.baseUrl))}.$extension');
+
   String manifestJson() => jsonEncode({
         'generatedAt': 1757000000,
         'anime': {'a1': '${cdn.url}/poster-a1.jpg'},
@@ -191,8 +195,8 @@ void main() {
   test('清單會落盤, 下次開機帶著 ETag 去問就是一個 304', () async {
     await store.refresh();
     expect(agp.hitsOn('/thumbnails.json'), 1);
-    expect(File('${temp.path}/thumbnails.json').existsSync(), isTrue);
-    expect(File('${temp.path}/thumbnails.etag').readAsStringSync(), agp.etag);
+    expect(manifestFile('json').existsSync(), isTrue);
+    expect(manifestFile('etag').readAsStringSync(), agp.etag);
 
     final again = ThumbnailStore(client);
     addTearDown(again.dispose);
@@ -283,6 +287,42 @@ void main() {
     expect(agp.hitsOn('/thumbnail.webp'), 1);
     expect(store.cachedServerThumb('v9'), isNotNull);
     expect(cdn.hits, isEmpty);
+  });
+
+  test('server fallback thumbnails cannot be reused by another server',
+      () async {
+    await store.init();
+    final first = await store.resolve('private');
+    expect(await first!.readAsBytes(), fakeJpeg(7));
+    cdn.files['/thumbnail.webp'] = fakeJpeg(8);
+    client.baseUrl = cdn.url;
+    final second = await store.resolve('private');
+    expect(await second!.readAsBytes(), fakeJpeg(8));
+    expect(cdn.hitsOn('/thumbnail.webp'), 1);
+  });
+
+  test('an in-flight fallback from an old server is not returned after switch',
+      () async {
+    await store.init();
+    agp.hold = Completer<void>();
+    final pending = store.resolve('private');
+    await waitFor(() => agp.inFlight == 1, reason: 'old server request');
+
+    client.baseUrl = cdn.url;
+    agp.hold!.complete();
+
+    expect(await pending, isNull);
+  });
+
+  test('a new server cannot load a different server manifest from disk',
+      () async {
+    await store.refresh();
+    client.baseUrl = cdn.url;
+    final again = ThumbnailStore(client);
+    addTearDown(again.dispose);
+    await again.init();
+    expect(again.posterFor('a1'), isNull);
+    expect(store.posterFor('a1'), isNull);
   });
 
   test('小於 256 bytes 的 WebP 仍可作為縮圖', () async {
@@ -456,7 +496,7 @@ void main() {
     await store.clear();
     expect(store.isEmpty, isTrue);
     expect(store.stillFor('v1'), isNull);
-    expect(File('${temp.path}/thumbnails.json').existsSync(), isFalse);
+    expect(manifestFile('json').existsSync(), isFalse);
     expect(await store.cacheBytes(), 0);
   });
 }
