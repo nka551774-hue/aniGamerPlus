@@ -114,6 +114,7 @@ class FakeServer {
   /// 真的搬位元組的那條路: 認 Range, 而且可以停在半路.
   Future<void> _serveVideo(HttpRequest request, HttpResponse response) async {
     final range = request.headers.value('range') ?? '';
+    response.headers.set(HttpHeaders.etagHeader, '"fixture-video"');
     videoRanges.add(range);
     var start = 0;
     final match = RegExp(r'bytes=(\d+)-').firstMatch(range);

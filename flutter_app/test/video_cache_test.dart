@@ -24,6 +24,8 @@ class Upstream {
   /// 收到幾個請求. 用來確認第二次真的沒去問上游.
   int requests = 0;
   bool refuse = false;
+  bool corruptRange = false;
+  final List<String?> validators = [];
 
   /// 每 64 KB 之間歇一下, 用來模擬一條慢線路
   Duration chunkDelay = Duration.zero;
@@ -83,6 +85,7 @@ class Upstream {
 
       final data = upstream.data;
       final header = request.headers.value(HttpHeaders.rangeHeader);
+      upstream.validators.add(request.headers.value(HttpHeaders.ifRangeHeader));
       var start = 0;
       var end = data.length - 1;
       if (header != null && header.startsWith('bytes=')) {
@@ -95,6 +98,10 @@ class Upstream {
         response.statusCode = HttpStatus.partialContent;
         response.headers.set(
             HttpHeaders.contentRangeHeader, 'bytes $start-$end/${data.length}');
+        if (upstream.corruptRange && header != 'bytes=0-0') {
+          response.headers.set(HttpHeaders.contentRangeHeader,
+              'bytes ${start + 1}-$end/${data.length}');
+        }
       }
       response.headers.set(HttpHeaders.etagHeader, '"stub-v1"');
       response.headers.set(HttpHeaders.acceptRangesHeader, 'bytes');
@@ -218,6 +225,23 @@ void main() {
     expect(bytes, List<int>.filled(4096, 103));
     expect(upstream.segmentNumbers, [3, 4],
         reason: 'the seek reads disk, not the network');
+  });
+
+  test('invalid upstream offsets are rejected and never retained as cache',
+      () async {
+    final url = cache.wrap(
+        upstream: upstream.url, headers: const {}, key: 'invalid-range');
+    upstream.corruptRange = true;
+    try {
+      final invalid = await fetch(url, range: 'bytes=0-100');
+      expect(invalid, isNot(upstream.data.sublist(0, 101)));
+    } on HttpException {
+      // The response was cut short after validation failed.
+    }
+    expect(upstream.validators, contains('"stub-v1"'));
+    upstream.corruptRange = false;
+    expect(
+        await fetch(url, range: 'bytes=0-100'), upstream.data.sublist(0, 101));
   });
 
   for (final tail in [false, true]) {

@@ -38,12 +38,28 @@ class _Memo<T> {
 }
 
 class AgpClient {
-  AgpClient({required String baseUrl, this.token, http.Client? httpClient})
+  AgpClient({required String baseUrl, String? token, http.Client? httpClient})
       : _base = _normalize(baseUrl),
+        _token = token,
         _http = httpClient ?? http.Client();
 
   String _base;
-  String? token;
+  String? _token;
+  int _contextVersion = 0;
+  int _memoVersion = 0;
+  int _loginAttempt = 0;
+
+  /// In-flight results belong to the server/account that requested them.
+  int get contextVersion => _contextVersion;
+
+  String? get token => _token;
+
+  set token(String? value) {
+    if (_token == value) return;
+    _token = value;
+    _contextVersion++;
+    clearMemo();
+  }
 
   final http.Client _http;
   late final OpeningSkipLookup _openingSkip = OpeningSkipLookup(_http);
@@ -59,6 +75,7 @@ class AgpClient {
 
   /// 換伺服器或換帳號之後手上這份就不算數了
   void clearMemo() {
+    _memoVersion++;
     _seriesMemo.clear();
     _sourcesMemo.clear();
   }
@@ -78,8 +95,19 @@ class AgpClient {
   String get baseUrl => _base;
 
   set baseUrl(String value) {
-    _base = _normalize(value);
+    final normalized = _normalize(value);
+    if (_base == normalized) return;
+    _base = normalized;
+    // A credential from one dashboard must never be sent to another host.
+    _token = null;
+    _contextVersion++;
     clearMemo();
+  }
+
+  void _checkContext(int version) {
+    if (version != _contextVersion) {
+      throw ApiException(409, '伺服器或登入狀態已變更，請重試');
+    }
   }
 
   bool get hasServer => _base.isNotEmpty;
@@ -146,6 +174,7 @@ class AgpClient {
   Future<List<int>> streamSources(String sn) async {
     final memo = _sourcesMemo[sn];
     if (memo != null && memo.fresh(_sourcesTtl)) return memo.value;
+    final memoVersion = _memoVersion;
     try {
       final data = await _json('/stream/sources.json', {'id': sn});
       final raw = (data as Map)['resolutions'];
@@ -155,7 +184,9 @@ class AgpClient {
           .where((value) => value > 0)
           .toList();
       // 空陣列不留: 那通常是解析當下失敗, 不是這一集真的只有一種畫質
-      if (list.isNotEmpty) _sourcesMemo[sn] = _Memo(list);
+      if (list.isNotEmpty && memoVersion == _memoVersion) {
+        _sourcesMemo[sn] = _Memo(list);
+      }
       return list;
     } catch (_) {
       return const [];
@@ -169,7 +200,9 @@ class AgpClient {
   // -------------------------------------------------------------------- 基礎
 
   Future<http.Response> _get(String path, [Map<String, dynamic>? query]) async {
+    final version = _contextVersion;
     final response = await _http.get(uri(path, query), headers: authHeaders);
+    _checkContext(version);
     return response;
   }
 
@@ -199,6 +232,7 @@ class AgpClient {
   }
 
   Future<dynamic> _postJson(String path, Object body) async {
+    final version = _contextVersion;
     final response = await _http.post(
       uri(path),
       headers: {
@@ -207,6 +241,7 @@ class AgpClient {
       },
       body: jsonEncode(body),
     );
+    _checkContext(version);
     if (response.statusCode >= 400) _fail(response);
     if (response.bodyBytes.isEmpty) return null;
     try {
@@ -248,6 +283,7 @@ class AgpClient {
   /// 回傳的 body 為 null 表示「沒變, 用你手上那份」.
   Future<({String? body, String etag, bool notModified})> videoListIfChanged(
       String? etag) async {
+    final version = _contextVersion;
     final response = await _http.get(
       uri('/video_list.json'),
       headers: {
@@ -255,6 +291,7 @@ class AgpClient {
         if (etag != null && etag.isNotEmpty) 'If-None-Match': etag,
       },
     );
+    _checkContext(version);
     if (response.statusCode == 304) {
       return (body: null, etag: etag ?? '', notModified: true);
     }
@@ -272,6 +309,7 @@ class AgpClient {
   /// 當成「沒有清單」退回 /thumbnail.webp, 不是一個要顯示的錯誤.
   Future<({String? body, String etag, bool notModified})> thumbnailManifest(
       String? etag) async {
+    final version = _contextVersion;
     final response = await _http.get(
       uri('/thumbnails.json'),
       headers: {
@@ -279,6 +317,7 @@ class AgpClient {
         if (etag != null && etag.isNotEmpty) 'If-None-Match': etag,
       },
     );
+    _checkContext(version);
     if (response.statusCode == 304) {
       return (body: null, etag: etag ?? '', notModified: true);
     }
@@ -298,9 +337,10 @@ class AgpClient {
   Future<Map<String, dynamic>> seriesJson(String videoSn) async {
     final memo = _seriesMemo[videoSn];
     if (memo != null && memo.fresh(_seriesTtl)) return memo.value;
+    final memoVersion = _memoVersion;
     final data = await _json('/watch/series.json', {'id': videoSn});
     final map = (data as Map).cast<String, dynamic>();
-    _seriesMemo[videoSn] = _Memo(map);
+    if (memoVersion == _memoVersion) _seriesMemo[videoSn] = _Memo(map);
     return map;
   }
 
@@ -385,7 +425,9 @@ class AgpClient {
   /// A cold server builds its catalogue in the background. Keep the caller's
   /// loading state until data arrives, rather than caching an empty detail.
   Future<dynamic> _catalogJson(String path, Map<String, dynamic> query) async {
+    final version = _contextVersion;
     for (var attempt = 0; attempt < 60; attempt++) {
+      _checkContext(version);
       final data = await _json(path, query);
       final items = data['items'] as List?;
       if (data['loading'] != true || (items != null && items.isNotEmpty)) {
@@ -475,6 +517,8 @@ class AgpClient {
   /// /login 成功是一個帶 Set-Cookie 的 302, 失敗是導回 ./login?error=1 ——
   /// 所以要自己攔重導向, 從標頭裡把 token 撿出來.
   Future<String> login(String username, String password) async {
+    final version = _contextVersion;
+    final attempt = ++_loginAttempt;
     final request = http.Request('POST', uri('/login'))
       ..followRedirects = false
       ..headers['Content-Type'] =
@@ -483,6 +527,10 @@ class AgpClient {
 
     final streamed = await _http.send(request);
     final body = await streamed.stream.bytesToString();
+    _checkContext(version);
+    if (attempt != _loginAttempt) {
+      throw ApiException(409, '已有較新的登入請求，請重試');
+    }
 
     final cookie = _tokenFromSetCookie(streamed.headers);
     if (cookie != null && cookie.isNotEmpty) {
@@ -517,6 +565,7 @@ class AgpClient {
   };
 
   Future<void> register(String username, String pw1, String pw2) async {
+    final version = _contextVersion;
     final request = http.Request('POST', uri('/register'))
       ..followRedirects = false
       ..headers['Content-Type'] =
@@ -525,6 +574,7 @@ class AgpClient {
 
     final streamed = await _http.send(request);
     final body = await streamed.stream.bytesToString();
+    _checkContext(version);
     final location = streamed.headers['location'] ?? '';
 
     // 成功是導到 ./login?error=3 (「註冊成功, 請登入」)
@@ -600,13 +650,16 @@ class AgpClient {
   }
 
   Future<void> logout() async {
+    final version = _contextVersion;
     try {
       await _get('/logout');
     } catch (_) {
       // 伺服器連不上也要能在本機登出
     }
-    token = null;
-    clearMemo();
+    if (version == _contextVersion) {
+      token = null;
+      clearMemo();
+    }
   }
 
   // ---------------------------------------------------------------- 用戶管理
@@ -711,6 +764,7 @@ class AgpClient {
   }
 
   Future<void> saveSnList(String text) async {
+    final version = _contextVersion;
     final response = await _http.post(
       uri('/sn_list'),
       headers: {
@@ -719,6 +773,7 @@ class AgpClient {
       },
       body: utf8.encode(text),
     );
+    _checkContext(version);
     if (response.statusCode >= 400) _fail(response);
   }
 

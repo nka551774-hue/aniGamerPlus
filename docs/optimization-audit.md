@@ -4,6 +4,8 @@
 
 本次針對 Python 下載流程、Dashboard API、片單與縮圖處理、網頁快取及發佈工作流程進行程式碼審核與離線回歸測試。以下記載已修復問題、可重現的效能證據和仍存在的限制。沒有使用實際帳戶下載影片，也未將本機設定或帳戶資料收錄到報告。
 
+前面各節保留第一輪審核的環境與結果；2026-10-25 接手後的新修改、Flutter 驗證與更新限制記於文末「第二輪接手審核」。
+
 ## 已修復問題
 
 | 範圍 | 原有問題及影響 | 修復方式 |
@@ -107,3 +109,64 @@ python -m pip_audit --progress-spinner off
 最後一條需另行安裝 `pip-audit`；因上述剩餘通報會回傳非零退出碼。完整離線測試需要 Chromium 和 ffmpeg；本次的 ffmpeg 僅置於忽略的 `.agpwork/bin`，未修改系統 PATH 或將執行檔提交。未執行會觸發真實帳號下載的 `test_real_server_e2e.py`。本機沒有 Flutter SDK 或 Docker，未宣稱已完成 Flutter 原生建置、裝置播放、容器建置或真實動畫瘋登入／下載驗證。
 
 Anime1.me 插件在既有提交中已刻意移除，僅修正過期 README 與對應測試的可選插件判斷，沒有恢復該插件。Playwright 改為只在瀏覽器 fixture 載入，避免未安裝瀏覽器依賴時連後端測試也全部跳過。
+
+## 第二輪接手審核
+
+日期：2026-10-25；本輪比較基準為 `5427d47aea0666f20e6448f32c92500dc989fc4e`。接手時已有尚未完成的 staged 修正與三份 deep regression 測試；首次執行為 **32 passed、19 failed**，因此先保留既有意圖，再逐項重現與完成。
+
+### 專案結構與資料流
+
+| 範圍 | 責任與本輪檢查邊界 |
+| --- | --- |
+| `aniGamerPlus.py`、`Anime.py` | CLI／排程／手動任務、SQLite 狀態、HLS 分片、ffmpeg 合併及檔案發佈。確認重試、同集並行與失敗清理沒有互相覆寫。 |
+| `Config.py`、`Danmu.py` | 設定、限流／鎖、網路 Session、原子寫入與 ASS 產生。確認例外不會耗盡鎖、不會污染共用過濾設定或毀掉舊字幕。 |
+| `Dashboard/Server.py` | FastAPI 權限與帳戶儲存、媒體 Range／快取、HLS 回源。以 TestClient、loopback HTTP 與失敗注入檢驗協定及儲存錯誤。 |
+| `Catalog.py`、`OpeningSkip.py`、`Dashboard/thumbnail_cache.py` | 片單、片頭時間比對與縮圖；沿用第一輪優化，完整測試再次覆蓋。 |
+| `Dashboard/templates`、`Dashboard/static` | 網頁播放、片庫與 PWA；完整 Chromium 測試覆蓋播放器及網頁行為。 |
+| `flutter_app/lib/src/api`、`state` | 原生客戶端 API、帳戶、下載狀態與 isolate 影片快取；新增伺服器／帳戶切換與實際 loopback 續傳測試。 |
+| `flutter_app/lib/src/pages`、`widgets`、`packages` | UI、播放器與原生平台橋接；執行既有 widget 測試與靜態分析，未宣稱實機原生外掛已驗證。 |
+| `tests`、`flutter_app/test`、`.github/workflows` | 後端／網頁／Flutter 回歸與 CI；保留真實帳戶測試的獨立執行邊界，不讀取本機帳戶內容。 |
+
+### 本輪修復與實際行為
+
+| 問題 | 結果 |
+| --- | --- |
+| 同集兩個 Anime 實例共用暫存檔；失敗重試殘留上輪成功狀態與分類目錄 | 單程序以集數共用鎖，重試前清理狀態並從片庫根重新分類。8 個並行實例的測試觀察到下載區段最大並行數為 1。 |
+| 下載結果依四捨五入後 5 MB 門檻判定，短影片可能被當失敗 | 以實際發佈成功旗標與非空檔案為準；舊外部 Anime-like 介面保留一致的 5 MB fallback。失敗合併不發送完成通知。 |
+| SQLite commit／close 例外可能永久占用 gate | statement 成功後才 commit；cursor／connection 清理各自有 finally，最外層一定釋放 gate。 |
+| 帳戶 JSON 損毀／無法讀取可能重建預設使用者；磁碟同步錯誤被忽略 | 僅首次檔案不存在才初始化；損毀、重複帳號及讀寫故障回 503 並保留原檔，保留未知頂層 metadata。ENOSPC／EIO 不再當作成功同步。 |
+| 彈幕解析失敗先清空舊 ASS，線上關鍵字污染共用列表或被當作 regex | 完整生成後才原子發佈，複製設定列表，線上關鍵字做 literal escape；使用者自行設定的 regex 保持原意。 |
+| If-Range 被忽略、ETag 沒引號、日期條件蓋過不匹配的 ETag、巨大 Range 整數回 500 | 檔案替換回 200 讓客戶端重抓；標準 ETag／弱比較／清單／wildcard 正確處理，If-None-Match 優先；不合理 Range 回 416。 |
+| HLS 重導向後基底錯誤、相對路徑拼接錯誤、非零媒體序號遺失 | 依最終播放清單 URL 做標準 URL resolution，保留媒體序號與既有 IV，拒絕 HTTP(S) 以外的資源 scheme。 |
+| 同時索取金鑰重複回源；短暫解析失敗被快取半小時 | 8 個同時金鑰請求實際只回源 1 次；失敗解析退避改為 30 秒，成功解析仍保留原 30 分鐘。金鑰必須為 16 bytes。 |
+| 回源完整緩衝沒有位元組限制 | libcurl callback 在接收解壓後 bytes 時限制大小，超量立即中止。一般回應 16 MiB、playlist 2 MiB、key 16 bytes、segment 32 MiB；identity／gzip／chunked 均有 loopback 測試。 |
+| Windows 非 ANSI 專案路徑讓 curl_cffi 載入 CA bundle 就失敗 | 只在必要時將公開 CA 憑證複製至程序私有暫存目錄，沿用原憑證內容及 TLS 驗證；程序結束清理，不複製帳戶資料。 |
+| Flutter 換伺服器仍帶舊 token、舊請求回來污染新帳戶快取、晚到登入／登出互蓋 | 切換上下文時失效 pending 結果與 memo；以登入請求序號保留最新登入；切換伺服器同時清除持久化 token 與帳戶觀看狀態。 |
+| Flutter 416 直接視為完成，206 偏移／總長度未驗證 | 驗證 Content-Range 與實際長度後才發佈；續傳記錄來源 URL 與 validator，送 If-Range。收到完整 200 重新下載，舊格式沒有 validator 的 Dart 前景部分檔安全地從頭重抓。iOS URLSession 續傳格式未修改。 |
+| 影片快取探測可能整集下載一次、上游錯誤範圍進入快取 | 1-byte probe 不符就取消，後續 Range 帶 If-Range 並驗證 offset／total／長度；錯誤資料不留在快取。 |
+
+金鑰請求 8 → 1 與同集互斥是操作次數／正確性的證據；本輪沒有隔離其他專案建置進行產品吞吐量測，因此不新增整體效能百分比。前面的縮圖量測屬第一輪歷史結果。
+
+### 本輪驗證與限制
+
+Python 3.11 完整離線套件已通過 **565 passed、1 skipped，205.69 秒**，唯一跳過仍為已移除的可選 Anime1.me 插件。之後新增 3 個針對小型成功影片、同集 8 執行緒互斥與 Unicode CA 的測試；`test_core_deep_regressions.py` 單獨 **18 passed**。複審另外發現 curl_cffi 會忽略 callback 回傳的普通短長度（含 0），已改用 `CURL_WRITEFUNC_ERROR`；新測試讓 loopback 上游逐塊傳送 64 MiB，確認超量後 5 秒內斷線且未傳完整份，串流套件 **20 passed，9.11 秒**。這是完整套件及後續增量驗證，沒有把次數相加當成單次結果。真實 ffmpeg 合成 HLS、解密與 Chromium 網頁測試均有執行。`pip check` 與 `git diff --check` 通過。
+
+主代理複審後，以所有最終程式與新增測試再次完整執行：**569 passed、1 skipped、61 warnings，143.98 秒**。唯一跳過仍是可選 Anime1.me 插件；警告為既有相依套件淘汰提示。此結果涵蓋最後的 libcurl 中止修復與新增回歸。
+
+Flutter 使用本輪準備的 **Flutter 3.47.8 / Dart 3.13.7**。SDK 釘選的 matcher、meta、test_api、vector_math 四個間接依賴隨 `pub get` 更新；沒有全面升級應用依賴。Unicode 路徑在此 SDK 的分析伺服器觸發 LSP 長度解析錯誤，以 Windows `subst` 將整個儲存庫映射到暫時 ASCII 磁碟路徑後驗證同一批檔案，保留 `../tests/fixtures` 相對位置。
+
+最終 `flutter analyze --no-fatal-infos` 回報 **No issues found**；`flutter test` 完整 **376 passed，58 秒**；停用更新器的 AAB 組態另 **2 passed**。首次映射僅包含 flutter_app，造成外層測試素材不可見，修正為整個儲存庫後完整重跑通過；沒有移除測試或放寬斷言。新增下載測試的清理也已等待工作完成再刪除暫存目錄。
+
+```powershell
+$env:PATH = (Join-Path $PWD '.agpwork\bin') + ';' + $env:PATH
+.\.venv\Scripts\python.exe -m pytest tests -q -ra --ignore=tests/test_real_server_e2e.py
+.\.venv\Scripts\python.exe -m pytest tests/test_core_deep_regressions.py -q
+# 以下於 flutter_app/，使用 Flutter SDK 執行
+flutter analyze --no-fatal-infos
+flutter test
+flutter test --dart-define=APP_UPDATER=false test/app_updater_build_test.dart
+```
+
+仍未執行真實動畫瘋帳號登入／下載、Android/iOS release build、實體裝置播放或 Docker 建置；上面的離線測試不等於這些環境已驗證。第一輪記載的 Requests 相依上限仍存在，本輪沒有為消除通報而強行放寬 solver 約束。HLS proxy 的 URI 相容修正不代表全面 SSRF 防護，也沒有新增跨程序檔案互斥保證。
+
+Windows CA 路徑相容處理仍需要系統暫存目錄可由目前 ANSI code page 表示；若使用者名稱與 TEMP 本身也不可表示，會保留錯誤而不關閉 TLS 驗證，需將 TEMP 設至可表示且可寫的目錄。憑證副本於本程序中快取，更新信任憑證後應重新啟動程式。

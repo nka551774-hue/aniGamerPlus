@@ -8,6 +8,11 @@
 
 import os, json, re, sys, requests, time, random, codecs, chardet, threading
 import tempfile
+import weakref
+import locale
+import functools
+import shutil
+import certifi
 import sqlite3
 import socket
 import warnings
@@ -63,6 +68,19 @@ max_multi_downloading_segment = 5
 current_sn_list_all = {}
 tasks_progress_rate = {}  # 储存任务进度, 供面板使用,
 _sn_list_lock = threading.RLock()
+_episode_download_locks = weakref.WeakValueDictionary()
+_episode_download_locks_guard = threading.Lock()
+
+
+def get_episode_download_lock(sn):
+    """Share one episode's temporary files across CLI and dashboard imports."""
+    key = str(int(sn))
+    with _episode_download_locks_guard:
+        lock = _episode_download_locks.get(key)
+        if lock is None:
+            lock = threading.Lock()
+            _episode_download_locks[key] = lock
+        return lock
 
 
 class _ResizableSemaphore:
@@ -1130,6 +1148,36 @@ def renew_cookies(new_cookie, log=True):
             break
 
 
+_curl_ca_temp = None
+_curl_ca_lock = threading.Lock()
+
+
+@functools.lru_cache(maxsize=8)
+def curl_ca_bundle(path=None):
+    """Keep certificate verification working in non-ANSI Windows checkouts.
+
+    libcurl opens CA paths through the Windows ANSI API. Python can read a
+    Unicode path that that API cannot represent, so copy only the public CA
+    bundle into a private temporary directory instead of disabling TLS checks.
+    """
+    global _curl_ca_temp
+    path = path or os.environ.get('REQUESTS_CA_BUNDLE') or os.environ.get('CURL_CA_BUNDLE') or certifi.where()
+    if os.name != 'nt':
+        return path
+    try:
+        path.encode(locale.getpreferredencoding(False))
+        return path
+    except UnicodeEncodeError:
+        pass
+    with _curl_ca_lock:
+        if _curl_ca_temp is None:
+            _curl_ca_temp = tempfile.TemporaryDirectory(prefix='agp-curl-ca-')
+        destination = os.path.join(_curl_ca_temp.name, str(len(os.listdir(_curl_ca_temp.name))) + '.pem')
+        destination.encode(locale.getpreferredencoding(False))
+        shutil.copyfile(path, destination)
+        return destination
+
+
 def bahamut_request(method, url, **kwargs):
     # 巴哈站點請求統一走 curl-cffi，通過 TLS 指紋驗證
     settings = read_settings()
@@ -1147,7 +1195,8 @@ def bahamut_request(method, url, **kwargs):
     if settings.get('use_proxy') and settings.get('proxy'):
         kwargs['proxies'] = {'https': settings['proxy'], 'http': settings['proxy']}
     kwargs.setdefault('timeout', 10)
-    session = curl_requests.Session(impersonate=impersonate, ja3=ja3, akamai=akamai)
+    session = curl_requests.Session(impersonate=impersonate, ja3=ja3, akamai=akamai,
+                                    verify=curl_ca_bundle())
     try:
         return session.request(method, url, **kwargs)
     except curl_requests.RequestsError as e:
@@ -1274,6 +1323,11 @@ def add_sn_to_list(sn, mode='all'):
 def write_json_atomic(path, data):
     """Publish a complete JSON snapshot without exposing a truncated file."""
     __atomic_write(path, json.dumps(data, ensure_ascii=False))
+
+
+def write_text_atomic(path, text):
+    """Publish generated text only after the complete result is available."""
+    __atomic_write(path, text)
 
 
 def __atomic_write(path, text):

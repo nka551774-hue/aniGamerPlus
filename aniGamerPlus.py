@@ -79,6 +79,37 @@ def build_anime(sn):
     return anime
 
 
+def _close_database(cursor, connection):
+    """Always return the gate, even when SQLite cleanup itself fails."""
+    try:
+        if cursor is not None:
+            cursor.close()
+    finally:
+        try:
+            if connection is not None:
+                connection.close()
+        finally:
+            db_locker.release()
+
+
+def _download_completed(anime):
+    # A successful ffmpeg/publication result is authoritative; rounded MB is
+    # only display metadata and valid short episodes can round all the way to
+    # zero. Retain the old size contract for external Anime-like integrations.
+    completed = getattr(anime, 'download_succeeded', None)
+    if completed is not None:
+        if not completed:
+            return False
+        try:
+            return os.path.isfile(anime.local_video_path) and os.path.getsize(anime.local_video_path) > 0
+        except (OSError, TypeError):
+            return False
+    try:
+        return float(anime.video_size or 0) >= 5
+    except (TypeError, ValueError):
+        return False
+
+
 def read_db_all():
     # db_locker 是全程序唯一的 Semaphore(1). 原本只在 IndexError 的路徑上 release,
     # 任何其它例外(資料庫鎖住、欄位是 NULL、磁碟滿…)都會把它永久吃掉, 之後每一個
@@ -108,11 +139,7 @@ def read_db_all():
                            'timestamp': int(datetime.strptime(values[i][9], "%Y-%m-%d %H:%M:%S").timestamp())}
         return anime_db
     finally:
-        if cursor is not None:
-            cursor.close()
-        if conn is not None:
-            conn.close()
-        db_locker.release()
+        _close_database(cursor, conn)
 
 
 def read_db(sn):
@@ -139,11 +166,7 @@ def read_db(sn):
                 'local_file_path': values[8],
                 'timestamp': int(datetime.strptime(values[9], "%Y-%m-%d %H:%M:%S").timestamp())}
     finally:
-        if cursor is not None:
-            cursor.close()
-        if conn is not None:
-            conn.close()
-        db_locker.release()
+        _close_database(cursor, conn)
 
 
 def insert_db(anime):
@@ -167,13 +190,9 @@ def insert_db(anime):
                 anime_dict)
         except sqlite3.IntegrityError as e:
             err_print(anime_dict['sn'], 'ＤＢ错误', 'title=' + anime_dict['title'] + ' 数据已存在！' + str(e), status=1)
+        conn.commit()
     finally:
-        if cursor is not None:
-            cursor.close()
-        if conn is not None:
-            conn.commit()
-            conn.close()
-        db_locker.release()
+        _close_database(cursor, conn)
 
 
 def update_db(anime):
@@ -186,16 +205,7 @@ def update_db(anime):
     try:
         # 更新数据库 status, resolution, file_size 资料
         anime_dict = {}
-        try:
-            # 僅上傳模式下 video_size 是從資料庫塞回來的, 有可能是 None
-            video_size = float(anime.video_size or 0)
-        except (TypeError, ValueError):
-            video_size = 0
-        if video_size > 5:
-            anime_dict['status'] = 1
-        else:
-            # 下载失败
-            anime_dict['status'] = 0
+        anime_dict['status'] = int(_download_completed(anime))
 
         if anime.upload_succeed_flag:
             anime_dict['remote_status'] = 1
@@ -220,13 +230,9 @@ def update_db(anime):
             "file_size=:file_size,"
             "local_file_path=:local_file_path WHERE sn=:sn",
             anime_dict)
+        conn.commit()
     finally:
-        if cursor is not None:
-            cursor.close()
-        if conn is not None:
-            conn.commit()
-            conn.close()
-        db_locker.release()
+        _close_database(cursor, conn)
 
 
 def upload_video(anime, bangumi_tag=''):
@@ -602,6 +608,8 @@ def worker(sn, sn_info, realtime_show_file_size=False):
             anime.local_video_path = local_file_path  # 告知文件位置
             anime.video_size = anime_in_db['file_size']  # 通過 update_db() 下载状态检查
             anime.video_resolution = anime_in_db['resolution']  # 避免更新时把分辨率变成0
+            if hasattr(anime, 'download_succeeded'):
+                anime.download_succeeded = True  # This file was published by a previous run.
 
             try:
                 if not upload_video(anime, bangumi_tag):  # 如果上传失败
@@ -641,7 +649,7 @@ def worker(sn, sn_info, realtime_show_file_size=False):
             err_print(sn, '下載異常', '異常詳情:\n' + traceback.format_exc(), status=1, display=False)
             anime.video_size = 0
 
-        if anime.video_size < 5:
+        if not _download_completed(anime):
             # 下载失败
             dequeue()
             err_msg_detail = 'title=\"' + anime.get_title() + '\" 從任務列隊中移除, 等待下次更新重試.'
@@ -864,7 +872,7 @@ def __download_only(sn, dl_resolution='', dl_save_dir='', realtime_show_file_siz
             err_print(sn, '下載異常', '異常詳情:\n' + traceback.format_exc(), status=1, display=False)
             anime.video_size = 0
 
-        while anime.video_size < 5:
+        while not _download_completed(anime):
             if err_counter >= 3:
                 err_print(sn, '終止任務', 'title=' + anime.get_title() + ' 任務失敗達三次! 終止任務!', status=1)
                 if int(sn) in Config.tasks_progress_rate.keys():

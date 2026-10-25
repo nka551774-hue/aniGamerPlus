@@ -25,12 +25,14 @@
 import asyncio
 import json, sys, os, re, time
 import tempfile
+import errno
 import weakref
 import threading, traceback
 import random, string, hashlib, hmac, secrets
 import platform, shutil, subprocess
 
 from curl_cffi import requests as curl_requests
+from curl_cffi.curl import CURL_WRITEFUNC_ERROR
 from aniGamerPlus import Config
 from aniGamerPlus import __cui as cui
 from aniGamerPlus import __get_danmu_only
@@ -252,11 +254,23 @@ def get_file_headers(path):
     # Last-Modified
     last_modified = http_date(stat.st_mtime)
 
-    # ETag (依檔案大小 + 修改時間)
-    etag_base = f"{stat.st_mtime}-{stat.st_size}".encode()
-    etag = hashlib.md5(etag_base).hexdigest()
+    # Keep sub-second changes and atomic replacements distinguishable. HTTP
+    # entity tags are quoted; Last-Modified has only one-second precision.
+    etag_base = f"{stat.st_mtime_ns}-{stat.st_ctime_ns}-{stat.st_size}-{stat.st_ino}".encode()
+    etag = '"%s"' % hashlib.md5(etag_base).hexdigest()
 
     return etag, last_modified, stat.st_size
+
+
+def _not_modified(request, etag, last_modified=None):
+    value = request.headers.get('If-None-Match')
+    if value is not None:
+        # GET/HEAD use weak comparison, and If-None-Match takes precedence
+        # even when none of its validators match the current representation.
+        return value.strip() == '*' or any(
+            item.removeprefix('W/') == etag
+            for item in re.findall(r'(?:W/)?"[^"\r\n]*"', value))
+    return last_modified is not None and request.headers.get('If-Modified-Since') == last_modified
 
 
 def _apply_cache_headers(resp, current_settings, max_age):
@@ -450,6 +464,17 @@ def _replace_with_retry(src, dst, attempts=25, delay=0.02):
             time.sleep(delay)
 
 
+class UserDataUnavailable(OSError):
+    """Account storage could not be read or safely published; never reset it."""
+
+
+@app.exception_handler(UserDataUnavailable)
+async def _userdata_unavailable_response(request, error):
+    logger.error('Account storage unavailable: %s', type(error.__cause__).__name__)
+    return JSONResponse({'message': 'Account storage is temporarily unavailable'},
+                        status_code=503, headers={'Cache-Control': 'no-store'})
+
+
 def _save_userdata_locked(userdata):
     """Atomic filesystem write. Caller must hold userdata_lock.
 
@@ -469,8 +494,9 @@ def _save_userdata_locked(userdata):
             f.flush()
             try:
                 os.fsync(f.fileno())
-            except OSError:
-                pass
+            except OSError as error:
+                if error.errno not in (errno.EINVAL, errno.ENOSYS, errno.ENOTSUP):
+                    raise
         _replace_with_retry(tmp_name, userdata_path)
         try:
             dir_fd = os.open(directory, os.O_RDONLY | getattr(os, 'O_DIRECTORY', 0))
@@ -484,11 +510,13 @@ def _save_userdata_locked(userdata):
                     pass
             finally:
                 os.close(dir_fd)
-    except BaseException:
+    except BaseException as error:
         try:
             os.unlink(tmp_name)
         except OSError:
             pass
+        if isinstance(error, OSError):
+            raise UserDataUnavailable('Unable to save account storage') from error
         raise
 
 
@@ -503,33 +531,34 @@ def _load_userdata_locked():
     default_users = settings['dashboard']['user_control']['default_user']
     changed = False
 
-    if os.path.exists(userdata_path):
-        try:
-            with open(userdata_path, 'r', encoding='utf-8') as f:
-                userdata = json.load(f)
-        except (json.JSONDecodeError, OSError, ValueError):
-            userdata = {"users": []}
-            changed = True
-    else:
+    try:
+        with open(userdata_path, 'r', encoding='utf-8') as f:
+            userdata = json.load(f)
+    except FileNotFoundError:
+        # Only first-run absence may bootstrap defaults. A damaged or
+        # temporarily unreadable store must never reset users/passwords.
         userdata = {"users": []}
         changed = True
+    except (OSError, ValueError) as error:
+        raise UserDataUnavailable('Unable to read account storage') from error
 
+    if not isinstance(userdata, dict):
+        raise UserDataUnavailable('Account storage must contain an object')
     raw_users = userdata.get('users')
     if not isinstance(raw_users, list):
-        raw_users = []
-        changed = True
+        raise UserDataUnavailable('Account storage must contain a user list')
 
     users = []
     existing_by_name = {}
     for raw_user in raw_users:
+        if not isinstance(raw_user, dict):
+            raise UserDataUnavailable('Invalid account record')
         normalized_user, user_changed = _normalize_user(raw_user)
         if not normalized_user['username']:
-            changed = True
-            continue
+            raise UserDataUnavailable('Account record has no username')
         user_key = normalized_user['username'].lower()
         if user_key in existing_by_name:
-            changed = True
-            continue
+            raise UserDataUnavailable('Account storage contains duplicate usernames')
         users.append(normalized_user)
         existing_by_name[user_key] = normalized_user
         changed = changed or user_changed
@@ -554,7 +583,7 @@ def _load_userdata_locked():
             existing_user['role'] = default_role
             changed = True
 
-    userdata = {"users": users}
+    userdata['users'] = users
     if changed:
         _save_userdata_locked(userdata)
     return userdata
@@ -935,17 +964,44 @@ def _offload(func, *args, **kwargs):
     return func(*args, **kwargs)
 
 
-def _curl_perform(session_kwargs, url, request_kwargs):
-    session = curl_requests.Session(**session_kwargs)
+def _curl_perform(session_kwargs, url, request_kwargs, max_bytes=None):
+    session = curl_requests.Session(verify=Config.curl_ca_bundle(), **session_kwargs)
     try:
-        return session.request('get', url, **request_kwargs)
+        if max_bytes is None:
+            return session.request('get', url, **request_kwargs)
+        body = bytearray()
+        exceeded = False
+
+        def receive(chunk):
+            nonlocal exceeded
+            # libcurl passes decoded bytes here, so gzip and chunked replies
+            # cannot bypass the bound with a small/missing Content-Length.
+            if len(body) + len(chunk) > max_bytes:
+                exceeded = True
+                # curl_cffi ignores ordinary short counts such as 0; only its
+                # explicit libcurl error sentinel actually stops the transfer.
+                return CURL_WRITEFUNC_ERROR
+            body.extend(chunk)
+            return len(chunk)
+
+        try:
+            response = session.request('get', url, content_callback=receive, **request_kwargs)
+        except Exception as error:
+            if exceeded:
+                raise ValueError('Upstream response exceeds byte limit') from error
+            raise
+        if exceeded:
+            raise ValueError('Upstream response exceeds byte limit')
+        response.content = bytes(body)
+        return response
     finally:
         # These requests buffer their response; no consumer needs the session
         # afterwards. Release libcurl handles on both success and exceptions.
         session.close()
 
 
-def _bahamut_get(url, timeout=10, allow_redirects=True, extra_headers=None):
+def _bahamut_get(url, timeout=10, allow_redirects=True, extra_headers=None,
+                 max_bytes=16 * 1024 * 1024):
     """跟 Config.bahamut_request 用同一套指纹, 但配置在工作线程上读完再请求.
 
     read_settings() 顺手会删过期日志、必要时重写配置文件, 这些副作用一直只在
@@ -967,7 +1023,7 @@ def _bahamut_get(url, timeout=10, allow_redirects=True, extra_headers=None):
         request_kwargs['allow_redirects'] = False
     if settings.get('use_proxy') and settings.get('proxy'):
         request_kwargs['proxies'] = {'https': settings['proxy'], 'http': settings['proxy']}
-    return _offload(_curl_perform, session_kwargs, url, request_kwargs)
+    return _offload(_curl_perform, session_kwargs, url, request_kwargs, max_bytes)
 
 
 def _get_ffmpeg_path():
@@ -2144,6 +2200,7 @@ def _hls_bootstrap_entry(sn, current_settings, request):
 # 720P, 伺服器就現去拿 720P 的 chunklist, 金鑰跟分片轉手發給它. 磁碟上什麼都不留,
 # 也完全不碰下載佇列.
 STREAM_TTL = 30 * 60      # chunklist 網址是簽名過的, 半小時內重用是安全的
+STREAM_FAILURE_TTL = 30  # Temporary resolver failures need only brief backoff.
 STREAM_CACHE_MAX = 16     # 解析結果只是幾 KB 的字串表, 留最近幾集就夠
 STREAM_ORIGIN_HEADER = {
     'Origin': 'https://ani.gamer.com.tw',
@@ -2187,14 +2244,14 @@ def _stream_dict(sn):
     """{畫質: chunklist 網址}, 解析一次快取 30 分鐘."""
     sn_key = str(sn)
     cached = _stream_dict_cache.get(sn_key)
-    if cached and time.monotonic() - cached['at'] < STREAM_TTL:
+    if cached and time.monotonic() - cached['at'] < (STREAM_TTL if cached['dict'] else STREAM_FAILURE_TTL):
         return cached['dict']
 
     # 一集只解析一次: 同一集被兩個人同時打開時, 不該把解鎖/廣告那一串跟動畫瘋的
     # 互動做兩遍
     with _keyed_lock('stream-%s' % sn_key):
         cached = _stream_dict_cache.get(sn_key)
-        if cached and time.monotonic() - cached['at'] < STREAM_TTL:
+        if cached and time.monotonic() - cached['at'] < (STREAM_TTL if cached['dict'] else STREAM_FAILURE_TTL):
             return cached['dict']
         try:
             m3u8_dict = _offload(_stream_resolve_blocking, sn_key)
@@ -2215,9 +2272,10 @@ def _stream_dict(sn):
 
 def _stream_absolute(base, uri):
     # chunklist 裡的金鑰跟分片不保證是完整網址, 相對路徑要自己補回去
-    if re.match(r'https?://', uri, re.I):
-        return uri
-    return base.rstrip('/') + '/' + uri.lstrip('/')
+    resolved = urllib.parse.urljoin(base, uri)
+    if urllib.parse.urlsplit(resolved).scheme.lower() not in ('http', 'https'):
+        raise ValueError('Unsupported HLS resource scheme')
+    return resolved
 
 
 def _stream_parse_media(text):
@@ -2230,6 +2288,7 @@ def _stream_parse_media(text):
     key_line = ''
     key_uri = ''
     target_duration = 10
+    media_sequence = 0
     segments = []
     pending_extinf = ''
     pending_duration = 10.0
@@ -2247,6 +2306,13 @@ def _stream_parse_media(text):
                 target_duration = max(1, int(float(line.split(':', 1)[1])))
             except (IndexError, ValueError):
                 pass
+        elif line.startswith('#EXT-X-MEDIA-SEQUENCE:'):
+            value = line.split(':', 1)[1]
+            if not re.fullmatch(r'[0-9]{1,20}', value):
+                return None
+            media_sequence = int(value)
+            if media_sequence >= 2 ** 64:
+                return None
         elif line.startswith('#EXTINF'):
             pending_extinf = line
             try:
@@ -2270,6 +2336,7 @@ def _stream_parse_media(text):
         'key_line': key_line,
         'key_uri': key_uri,
         'target_duration': target_duration,
+        'media_sequence': media_sequence,
         'segments': segments,
         'total_duration': sum(segment['duration'] for segment in segments),
     }
@@ -2291,7 +2358,8 @@ def _stream_media(sn, res):
         if not url:
             return None
         try:
-            upstream = _bahamut_get(url, timeout=15, extra_headers=STREAM_ORIGIN_HEADER)
+            upstream = _bahamut_get(url, timeout=15, extra_headers=STREAM_ORIGIN_HEADER,
+                                    max_bytes=2 * 1024 * 1024)
         except KeyboardInterrupt:
             raise
         except BaseException as error:
@@ -2307,7 +2375,7 @@ def _stream_media(sn, res):
         entry = {
             'at': time.monotonic(),
             'parsed': parsed,
-            'base': url.split('?', 1)[0].rsplit('/', 1)[0],
+            'base': getattr(upstream, 'url', None) or url,
             'key': None,  # 真的有人來要 key.bin 時才回源, 拿到就留著
         }
         _stream_media_cache[cache_key] = entry
@@ -2318,21 +2386,23 @@ def _stream_media(sn, res):
 def _stream_key(sn, res, media):
     # 金鑰只有 16 bytes, 但 ExoPlayer/AVPlayer 不保證只要一次. 拿到就跟著這一份
     # chunklist 一起留著, 免得每次重載清單都往回源多打一發
-    if media['key']:
+    with _keyed_lock('stream-key-%s/%s' % (sn, res)):
+        if media['key']:
+            return media['key']
+        try:
+            upstream = _bahamut_get(_stream_absolute(media['base'], media['parsed']['key_uri']),
+                                    timeout=15, extra_headers=STREAM_ORIGIN_HEADER,
+                                    max_bytes=16)
+        except KeyboardInterrupt:
+            raise
+        except BaseException as error:
+            err_print(sn, '線上畫質', '取得 %sP 金鑰失敗: %s' % (res, error),
+                      status=1, display=False)
+            return b''
+        if upstream.status_code != 200 or len(upstream.content) != 16:
+            return b''
+        media['key'] = upstream.content
         return media['key']
-    try:
-        upstream = _bahamut_get(_stream_absolute(media['base'], media['parsed']['key_uri']),
-                                timeout=15, extra_headers=STREAM_ORIGIN_HEADER)
-    except KeyboardInterrupt:
-        raise
-    except BaseException as error:
-        err_print(sn, '線上畫質', '取得 %sP 金鑰失敗: %s' % (res, error),
-                  status=1, display=False)
-        return b''
-    if upstream.status_code != 200 or not upstream.content:
-        return b''
-    media['key'] = upstream.content
-    return media['key']
 
 
 def _stream_render(sn, res, parsed, ticket=None):
@@ -2344,7 +2414,7 @@ def _stream_render(sn, res, parsed, ticket=None):
         '#EXT-X-TARGETDURATION:%d' % parsed['target_duration'],
         # 跟 _hls_render() 同一個理由: #EXT-X-KEY 沒帶 IV 時, IV 就是分片序號.
         # 重新編號會讓解密整個對不上
-        '#EXT-X-MEDIA-SEQUENCE:0',
+        '#EXT-X-MEDIA-SEQUENCE:%d' % parsed.get('media_sequence', 0),
         # 這裡跟邊看邊下載不一樣 —— 上游那份是完整的一集, 不是還在長的東西, 所以是
         # VOD 而且一開始就有 ENDLIST, 播放器才肯讓人拖時間軸
         '#EXT-X-PLAYLIST-TYPE:VOD',
@@ -3244,7 +3314,7 @@ def get_thumbnail(request: Request):
             return _thumbnail_unavailable()
 
     etag, last_modified, file_size = get_file_headers(cache_path)
-    if request.headers.get('If-None-Match') == etag:
+    if _not_modified(request, etag, last_modified):
         resp = Response(status_code=304)
     elif request.method == 'HEAD':
         resp = Response(status_code=200)
@@ -3348,7 +3418,7 @@ def get_thumbnail_manifest(request: Request):
             return JSONResponse({"error": "login required"}, status_code=403)
 
     body, etag = _thumbnail_manifest()
-    if request.headers.get('If-None-Match') == etag:
+    if _not_modified(request, etag):
         resp = Response(status_code=304)
     elif request.method == 'HEAD':
         resp = Response(status_code=200, media_type='application/json')
@@ -3376,6 +3446,10 @@ def _parse_video_range(range_header, file_size):
     if size <= 0:
         return None
     text = str(range_header or '').strip()
+    # A useful single range is tiny; avoid unbounded integer parsing and
+    # Python's 4300-digit conversion exception on attacker-controlled input.
+    if len(text) > 128:
+        return None
     if not text.startswith('bytes='):
         return None
     spec = text[len('bytes='):].strip()
@@ -3452,8 +3526,7 @@ def getvid(request: Request):
     etag, last_modified, file_size = get_file_headers(path)
 
     # --- 瀏覽器快取檢查 ---
-    if request.headers.get("If-None-Match") == etag or \
-    request.headers.get("If-Modified-Since") == last_modified:
+    if _not_modified(request, etag, last_modified):
         resp = Response(status_code=304)  # Not Modified
         resp.headers['ETag'] = etag
         resp.headers['Last-Modified'] = last_modified
@@ -3462,6 +3535,9 @@ def getvid(request: Request):
 
     # 檢查 Range header: 單一 bytes 範圍才回 206, 其它一律 416.
     range_header = request.headers.get('Range', None)
+    if_range = request.headers.get('If-Range')
+    if if_range is not None and if_range not in (etag, last_modified):
+        range_header = None
 
     # --- Case 1: 沒有 Range → 直接回傳整份檔案 ---
     if not range_header:
@@ -3784,9 +3860,10 @@ def stream_segment(request: Request):
     if index < 0 or index >= len(segments):
         return JSONResponse({"error": "invalid segment"}, status_code=404)
 
-    url = _stream_absolute(media['base'], segments[index]['uri'])
     try:
-        upstream = _bahamut_get(url, timeout=30, extra_headers=STREAM_ORIGIN_HEADER)
+        url = _stream_absolute(media['base'], segments[index]['uri'])
+        upstream = _bahamut_get(url, timeout=30, extra_headers=STREAM_ORIGIN_HEADER,
+                                max_bytes=32 * 1024 * 1024)
     except KeyboardInterrupt:
         raise
     except BaseException as error:
@@ -3886,7 +3963,7 @@ def videolist(request: Request):
         return JSONResponse({'videos': []})
 
     etag, last_modified, file_size = get_file_headers(video_list_path)
-    if request.headers.get('If-None-Match') == etag or request.headers.get('If-Modified-Since') == last_modified:
+    if _not_modified(request, etag, last_modified):
         resp = Response(status_code=304)
     elif request.method == 'HEAD':
         resp = Response(status_code=200)

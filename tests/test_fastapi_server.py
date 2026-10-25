@@ -991,7 +991,8 @@ class FakeUpstream:
 def stream_env(monkeypatch, autouse_settings, settings, userdata):
     monkeypatch.setattr(server, '_find_video_entry', lambda sn: {'sn': sn})
     monkeypatch.setattr(server, '_stream_dict', lambda sn: {'720': 'https://cdn.example/c.m3u8?sig=1'})
-    monkeypatch.setattr(server, '_bahamut_get', lambda *a, **k: FakeUpstream(CHUNKLIST.encode()))
+    monkeypatch.setattr(server, '_bahamut_get', lambda url, **k: FakeUpstream(
+        b'0123456789abcdef' if 'enc.key' in url else CHUNKLIST.encode()))
     server._stream_dict_cache.clear()
     server._stream_media_cache.clear()
     yield

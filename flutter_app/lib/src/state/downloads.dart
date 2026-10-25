@@ -21,6 +21,7 @@ import 'package:path_provider/path_provider.dart';
 
 import '../api/client.dart';
 import '../api/models.dart';
+import 'http_range.dart';
 
 /// waiting: 伺服器上還沒有這一集, 已經幫它排了一個任務, 檔案出現才開始抓.
 enum DownloadStatus { waiting, queued, running, paused, done, failed }
@@ -72,6 +73,8 @@ class DownloadEntry {
   DownloadStatus status;
   String error;
   int addedAt;
+  String sourceUrl;
+  String resumeValidator;
 
   /// 使用者想不想要彈幕 (下載時的「一起抓彈幕」)
   bool wantDanmaku;
@@ -95,6 +98,8 @@ class DownloadEntry {
     this.total = 0,
     this.status = DownloadStatus.queued,
     this.error = '',
+    this.sourceUrl = '',
+    this.resumeValidator = '',
     int? addedAt,
     this.wantDanmaku = true,
     this.hasDanmaku = false,
@@ -125,6 +130,8 @@ class DownloadEntry {
         'total': total,
         'status': status.name,
         'error': error,
+        'sourceUrl': sourceUrl,
+        'resumeValidator': resumeValidator,
         'addedAt': addedAt,
         'wantDanmaku': wantDanmaku,
         'hasDanmaku': hasDanmaku,
@@ -149,6 +156,8 @@ class DownloadEntry {
         orElse: () => DownloadStatus.queued,
       ),
       error: (json['error'] ?? '').toString(),
+      sourceUrl: (json['sourceUrl'] ?? '').toString(),
+      resumeValidator: (json['resumeValidator'] ?? '').toString(),
       addedAt: int.tryParse('${json['addedAt']}') ?? 0,
       // 舊紀錄沒這個欄位, 當成「要」—— 這是預設值
       wantDanmaku: json['wantDanmaku'] != false,
@@ -649,10 +658,9 @@ class DownloadStore extends ChangeNotifier {
   }
 
   /// 同時開幾集. 原生傳輸又在背景的話不設限: 全部交給系統排.
-  int get _slots =>
-      _native != null && _backgrounded && _concurrency > 0
-          ? _entries.length
-          : _concurrency;
+  int get _slots => _native != null && _backgrounded && _concurrency > 0
+      ? _entries.length
+      : _concurrency;
 
   Future<void> _pump() async {
     if (_disposed || !_networkAllowed || _dir == null) return;
@@ -694,21 +702,36 @@ class DownloadStore extends ChangeNotifier {
         start = await part.length();
       }
 
-      final request = http.Request(
-          'GET',
-          _client.videoUrl(
-            entry.sn,
-            resolution: entry.resolution > 0 ? entry.resolution : null,
-          ));
+      final url = _client.videoUrl(entry.sn,
+          resolution: entry.resolution > 0 ? entry.resolution : null);
+      // A partial file without its original validator cannot be proven to
+      // belong to this representation (including after switching servers).
+      if (start > 0 &&
+          (entry.sourceUrl != url.toString() ||
+              entry.resumeValidator.isEmpty)) {
+        start = 0;
+      }
+      final request = http.Request('GET', url);
       request.headers.addAll(_client.authHeaders);
-      if (start > 0) request.headers['Range'] = 'bytes=$start-';
+      if (start > 0) {
+        request.headers['Range'] = 'bytes=$start-';
+        request.headers['If-Range'] = entry.resumeValidator;
+      }
 
       final response = await job.client.send(request);
       if (job.cancelled || _disposed) return;
 
       if (response.statusCode == 416) {
-        // 已經抓完了, 只是上次沒改名
+        // A rejected range can also mean the server replaced/truncated the
+        // video. Only a matching, nonempty total proves this part is complete.
+        final total = ByteContentRange.unsatisfiedTotal(
+            response.headers['content-range']);
+        if (start <= 0 || total != start) {
+          throw const HttpException('續傳範圍與伺服器檔案長度不符');
+        }
         await part.rename(target.path);
+        entry.received = start;
+        entry.total = start;
         await _finish(job, entry);
         return;
       }
@@ -722,8 +745,19 @@ class DownloadStore extends ChangeNotifier {
         _syncWaitingTimer();
         return;
       }
-      if (response.statusCode >= 400) {
+      if (response.statusCode != 200 && response.statusCode != 206) {
         throw HttpException('伺服器回應 ${response.statusCode}');
+      }
+
+      final range = response.statusCode == 206
+          ? ByteContentRange.parse(response.headers['content-range'])
+          : null;
+      if (response.statusCode == 206 &&
+          (range == null ||
+              range.start != start ||
+              (response.contentLength != null &&
+                  response.contentLength != range.length))) {
+        throw const HttpException('伺服器回傳的續傳範圍不正確');
       }
 
       // 200 表示伺服器不吃 Range (或檔案換了), 那就從頭來
@@ -733,8 +767,15 @@ class DownloadStore extends ChangeNotifier {
       }
 
       final length = response.contentLength ?? 0;
-      entry.total = start + length;
+      entry.total = range?.total ?? length;
       entry.received = start;
+      entry.sourceUrl = url.toString();
+      final etag = response.headers['etag'] ?? '';
+      entry.resumeValidator =
+          etag.startsWith('"') ? etag : response.headers['last-modified'] ?? '';
+      // Persist identity before writing bytes, so a process restart resumes
+      // only a file whose identity was actually received with those bytes.
+      await _save();
       notifyListeners();
 
       sink = part.openWrite(mode: start > 0 ? FileMode.append : FileMode.write);
@@ -742,6 +783,10 @@ class DownloadStore extends ChangeNotifier {
 
       await for (final chunk in response.stream) {
         if (job.cancelled) break;
+        if ((entry.total > 0 && entry.received + chunk.length > entry.total) ||
+            (range != null && entry.received + chunk.length > range.end + 1)) {
+          throw const HttpException('影片資料超出伺服器宣告的長度');
+        }
         sink.add(chunk);
         entry.received += chunk.length;
         sinceFlush += chunk.length;
@@ -769,7 +814,7 @@ class DownloadStore extends ChangeNotifier {
       }
 
       final written = await part.length();
-      if (entry.total > 0 && written < entry.total) {
+      if (written == 0 || (entry.total > 0 && written != entry.total)) {
         throw HttpException('傳輸中斷 ($written/${entry.total})');
       }
       if (await target.exists()) await target.delete();

@@ -107,6 +107,7 @@ class Anime:
         self._ffmpeg_path = ''
         self.video_resolution = 0
         self.video_size = 0
+        self.download_succeeded = False
         self.realtime_show_file_size = False
         self.upload_succeed_flag = False
         self._danmu = False
@@ -1001,6 +1002,7 @@ class Anime:
 
         self.local_video_path = output_file  # 记录保存路径, FTP上传用
         self._video_filename = filename  # 记录文件名, FTP上传用
+        self.download_succeeded = True
 
         err_print(self._sn, '下載完成', filename, status=2)
 
@@ -1087,6 +1089,7 @@ class Anime:
 
             self.local_video_path = output_file  # 记录保存路径, FTP上传用
             self._video_filename = filename  # 记录文件名, FTP上传用
+            self.download_succeeded = True
             err_print(self._sn, '下載完成', filename, status=2)
         else:
             err_msg_detail = filename + ' ffmpeg_return_code=' + str(
@@ -1094,6 +1097,23 @@ class Anime:
             err_print(self._sn, '下載失败', err_msg_detail, status=1)
 
     def download(self, resolution='', save_dir='', bangumi_tag='', realtime_show_file_size=False, rename='', classify=True):
+        # Manual and scheduled downloads share temp/<sn>, segment filenames
+        # and the merge output. Never let a second attempt overwrite files
+        # while the first attempt is still writing or cleaning them up.
+        with Config.get_episode_download_lock(self._sn):
+            self.download_succeeded = False
+            self.video_size = 0
+            self.local_video_path = ''
+            self._video_filename = ''
+            self.upload_succeed_flag = False
+            self._bangumi_dir = save_dir or self._settings['bangumi_dir']
+            try:
+                return self._download(resolution, save_dir, bangumi_tag,
+                                      realtime_show_file_size, rename, classify)
+            finally:
+                Config.tasks_progress_rate.pop(int(self._sn), None)
+
+    def _download(self, resolution='', save_dir='', bangumi_tag='', realtime_show_file_size=False, rename='', classify=True):
         self.realtime_show_file_size = realtime_show_file_size
         if not resolution:
             resolution = self._settings['download_resolution']
@@ -1129,10 +1149,8 @@ class Anime:
             self.video_size = 0
             return
 
-        check_ffmpeg = subprocess.Popen('ffmpeg -h', shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-        if check_ffmpeg.stdout.readlines():  # 查找 ffmpeg 是否已放入系统 path
-            self._ffmpeg_path = 'ffmpeg'
-        else:
+        self._ffmpeg_path = shutil.which('ffmpeg')
+        if not self._ffmpeg_path:
             # print('没有在系统PATH中发现ffmpeg，尝试在所在目录寻找')
             if 'Windows' in platform.system():
                 self._ffmpeg_path = os.path.join(self._working_dir, 'ffmpeg.exe')
@@ -1219,6 +1237,9 @@ class Anime:
         else:
             self.__ffmpeg_download_mode(resolution)
 
+        if not self.download_succeeded:
+            return
+
         # 任务完成, 从任务进度表中删除
         # 同一集兩條任務並行時, 各自把紀錄 del 掉會互踩: 後完成那條的 del
         # 已經找不到東西(前 1 條 del 過), KeyError 會炸掉收尾動作(彈幕/上傳).
@@ -1299,10 +1320,10 @@ class Anime:
                         'author': {
                             'name': '🔔 動畫瘋'
                         }}]}
-                r = requests.post(url, json=data)
+                r = requests.post(url, json=data, timeout=10)
                 if r.status_code != 204:
                     err_print(self._sn, 'discord NOTIFY ERROR', "Exception: Send msg error\nReq: " + r.text, status=1)
-            except:
+            except Exception as e:
                 err_print(self._sn, 'Discord NOTIFY UNKNOWN ERROR', 'Exception: ' + str(e), status=1)
 
         # plex 自動更新媒體庫
@@ -1313,10 +1334,10 @@ class Anime:
                     plex_section=self._settings['plex_section'],
                     plex_token=self._settings['plex_token']
                 )
-                r = requests.get(url)
+                r = requests.get(url, timeout=10)
                 if r.status_code != 200:
                     err_print(self._sn, 'Plex auto Refresh ERROR', status=1)
-            except:
+            except Exception as e:
                 err_print(self._sn, 'Plex auto Refresh UNKNOWN ERROR', 'Exception: ' + str(e), status=1)
         def m3u8(dir, name, title):
             filepath = os.path.join(dir, Config.legalize_filename(self._bangumi_name) + '.m3u8')

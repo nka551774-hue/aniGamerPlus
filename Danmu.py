@@ -1,5 +1,6 @@
 
 import json
+import io
 import random
 import re
 import os
@@ -25,6 +26,9 @@ class Danmu():
         return result and result.group(0)
 
     def download(self, ban_words, display=True):
+        # Online keywords belong to this response, not the shared settings
+        # list used by every later episode. Keep configured regexes intact.
+        ban_words = list(ban_words)
         settings = Config.read_settings()
         h = {
             'Content-Type': 'application/x-www-form-urlencoded;charset=utf-8',
@@ -58,9 +62,11 @@ class Danmu():
             online_ban_words = json.loads(ban_words_response.text)
             for online_ban_word in online_ban_words:
                 err_print(self._sn, '取得線上過濾彈幕', detail=online_ban_word['keyword'], status=0, display=False)
-                ban_words.append(online_ban_word['keyword'])
+                ban_words.append(re.escape(online_ban_word['keyword']))
 
-        output = open(self._full_filename, 'w', encoding='utf8')
+        # Parsing/formatting failures must leave a previous valid ASS intact.
+        # Buffer text first, then use the same atomic publication as config.
+        output = io.StringIO()
         danmu_template_file = os.path.join(Config.get_working_dir(), 'DanmuTemplate.ass')
         with open(danmu_template_file, 'r', encoding='utf8') as temp:
             for line in temp.readlines():
@@ -131,6 +137,7 @@ class Danmu():
             output.write(text)
             output.write('\n')
 
+        Config.write_text_atomic(self._full_filename, output.getvalue())
         err_print(self._sn, '彈幕下載完成', self._full_filename, status=2, display=display)
 
 

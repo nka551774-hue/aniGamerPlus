@@ -147,7 +147,13 @@ class AppState extends ChangeNotifier {
 
   Future<void> setServer(String url) async {
     await discord.forget(bestEffort: true);
+    final previousServer = client.baseUrl;
     client.baseUrl = url;
+    if (previousServer != client.baseUrl) {
+      await prefs.clearToken();
+      currentUser = null;
+      await _clearWatchTimes();
+    }
     await prefs.setServer(client.baseUrl);
     await discord.useAccount(client.baseUrl, '');
     await refreshAll();
@@ -221,15 +227,19 @@ class AppState extends ChangeNotifier {
   }
 
   Future<void> _loadSession() async {
+    final version = client.contextVersion;
     if (!hasServer) {
       offline = true;
       return;
     }
     try {
-      serverInfo = await client.serverInfo();
+      final info = await client.serverInfo();
+      if (version != client.contextVersion) return;
+      serverInfo = info;
       offline = false;
       lastError = '';
     } catch (error) {
+      if (version != client.contextVersion) return;
       offline = true;
       lastError = error.toString();
       currentUser = null;
@@ -241,7 +251,9 @@ class AppState extends ChangeNotifier {
       await discord.useAccount(client.baseUrl, '');
       return;
     }
-    currentUser = await client.currentUser();
+    final user = await client.currentUser();
+    if (version != client.contextVersion) return;
+    currentUser = user;
     if (currentUser == null && client.token != null) {
       // token 過期了
       await prefs.clearToken();
@@ -652,7 +664,13 @@ class AppState extends ChangeNotifier {
   Future<void> applyRemoteSetup(
       {required String server, String token = ''}) async {
     await discord.forget(bestEffort: true);
+    final previousServer = client.baseUrl;
     client.baseUrl = server;
+    if (previousServer != client.baseUrl) {
+      await prefs.clearToken();
+      currentUser = null;
+      await _clearWatchTimes();
+    }
     await prefs.setServer(client.baseUrl);
     if (token.isNotEmpty) {
       client.token = token;
@@ -830,7 +848,9 @@ class AppState extends ChangeNotifier {
     // 手上這一集在集數表裡找不到 (舊版伺服器的集數表可能不完整) 時,
     // 至少把它自己記下來
     final sn = fallbackSn ?? '';
-    if (sn.isNotEmpty && info.title.isNotEmpty && !_watchNames.containsKey(sn)) {
+    if (sn.isNotEmpty &&
+        info.title.isNotEmpty &&
+        !_watchNames.containsKey(sn)) {
       _watchNames[sn] = WatchName(
         name: info.title,
         episode: fallbackEpisode ?? '',
@@ -901,7 +921,9 @@ class AppState extends ChangeNotifier {
       final key = name.trim().toLowerCase();
       if (key.isEmpty) continue;
       final mine = result[key];
-      if (mine != null && mine.time.timestamp >= entry.value.timestamp) continue;
+      if (mine != null && mine.time.timestamp >= entry.value.timestamp) {
+        continue;
+      }
       result[key] = LastWatched(
         sn: entry.key,
         name: name,

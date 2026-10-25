@@ -32,6 +32,7 @@ import 'package:http/http.dart' as http;
 import 'package:http/io_client.dart';
 
 import 'mp4_prefetch.dart';
+import 'http_range.dart';
 
 /// 一塊多大. 小塊比較省 (跳轉時對齊浪費的少), 但一集會生出很多檔案;
 /// 1 MB 的話 428 MB 的一集全看完大約 428 塊.
@@ -761,14 +762,24 @@ class _CacheWorker {
     try {
       final response = await _open(
           target.upstream, {...target.headers, 'Range': 'bytes=0-0'});
-      // 那一個 byte 也要讀掉, 連線才回得去池子裡
-      await response.stream.timeout(_stallTimeout).drain<void>();
-      if (response.statusCode >= 400) return null;
-      final range = response.headers['content-range'] ?? '';
-      final total = int.tryParse(range.split('/').last.trim()) ?? 0;
-      if (total <= 0) return null;
+      final range = ByteContentRange.parse(response.headers['content-range']);
+      if (response.statusCode != 206 ||
+          range == null ||
+          range.start != 0 ||
+          range.end != 0) {
+        // A server ignoring Range may be sending an entire episode. Cancel
+        // this probe instead of downloading it once before the real playback.
+        await response.stream.listen((_) {}).cancel();
+        return null;
+      }
+      var received = 0;
+      await for (final chunk in response.stream.timeout(_stallTimeout)) {
+        received += chunk.length;
+        if (received > 1) return null;
+      }
+      if (received != 1) return null;
       return _Meta(
-        total: total,
+        total: range.total,
         etag: response.headers['etag'] ?? '',
         modified: response.headers['last-modified'] ?? '',
       );
@@ -851,7 +862,8 @@ class _CacheWorker {
   /// 播放器那一頭的連線從頭到尾是同一條, 它只會覺得這一段慢了幾秒 —— 以前
   /// 上游那條一死, 播放器就永遠等在那裡, 畫面上是一個掛著「1 B/s」的緩衝,
   /// 只能把 app 關掉重開.
-  Stream<List<int>> _upstreamRange(_Target target, int from, int to) async* {
+  Stream<List<int>> _upstreamRange(
+      _Target target, _Meta meta, int from, int to) async* {
     var at = from;
     var failures = 0;
     while (at <= to && !_closed) {
@@ -861,25 +873,41 @@ class _CacheWorker {
       }
       http.StreamedResponse response;
       try {
-        response = await _open(
-            target.upstream, {...target.headers, 'Range': 'bytes=$at-$to'});
+        response = await _open(target.upstream, {
+          ...target.headers,
+          'Range': 'bytes=$at-$to',
+          if (meta.etag.isNotEmpty) 'If-Range': meta.etag,
+          if (meta.etag.isEmpty && meta.modified.isNotEmpty)
+            'If-Range': meta.modified,
+        });
       } catch (error) {
         if (++failures > kUpstreamRetries) rethrow;
         continue;
       }
       final status = response.statusCode;
-      // 200 = 伺服器不吃 Range, 回的是整個檔. 從頭開始要的那一次還用得上,
-      // 接續的那幾次就接不起來了 —— 硬接會把錯的內容寫進快取
-      if (status >= 400 || (status == 200 && at != 0)) {
-        unawaited(response.stream.drain<void>().catchError((Object _) {}));
-        throw HttpException('上游回應 $status', uri: target.upstream);
+      final range = ByteContentRange.parse(response.headers['content-range']);
+      // Every cached byte must have the promised offset and file identity.
+      // 200 after If-Range means the representation changed; appending it
+      // would mix two videos even when their file lengths happen to match.
+      if (status != 206 ||
+          range == null ||
+          range.start != at ||
+          range.end > to ||
+          range.total != meta.total ||
+          (response.contentLength != null &&
+              response.contentLength != range.length)) {
+        await response.stream.listen((_) {}).cancel();
+        throw HttpException('上游回傳無效的 Range ($status)', uri: target.upstream);
       }
       final before = at;
       Object? problem;
       try {
         await for (final chunk in response.stream.timeout(_stallTimeout)) {
           if (chunk.isEmpty) continue;
-          final room = to - at + 1;
+          final room = range.end - at + 1;
+          if (room <= 0 || chunk.length > room) {
+            throw HttpException('上游資料超出宣告範圍', uri: target.upstream);
+          }
           final piece = chunk.length > room ? chunk.sublist(0, room) : chunk;
           at += piece.length;
           yield piece;
@@ -1188,7 +1216,7 @@ class _CacheWorker {
     // 還是全速把上游灌進記憶體. 慢線路上那等於「頻寬全部拿去抓沒人要的
     // 資料」, 畫面看起來就是明明有東西卻一直在轉圈.
     Stream<List<int>> body() async* {
-      await for (final chunk in _upstreamRange(target, aligned, stop)) {
+      await for (final chunk in _upstreamRange(target, meta, aligned, stop)) {
         _note(chunk.length);
         final chunkStart = pos;
 
