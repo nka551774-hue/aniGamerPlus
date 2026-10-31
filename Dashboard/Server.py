@@ -2638,7 +2638,16 @@ async def manual_task(request: Request):
     denied = await run_in_threadpool(_admin_api_preflight, request)
     if denied is not None:
         return denied
-    data = await request.json()
+    try:
+        data = await request.json()
+    except _RequestBodyTooLarge:
+        raise
+    except Exception:
+        return JSONResponse(
+            {'success': False, 'message': 'Invalid JSON body'}, status_code=400)
+    if not isinstance(data, dict):
+        return JSONResponse(
+            {'success': False, 'message': 'Invalid request'}, status_code=400)
     return await run_in_threadpool(_manual_task_blocking, request, data)
 
 
@@ -2647,6 +2656,24 @@ def _manual_task_blocking(request, data):
     denied = _admin_api_guard(request, current_settings)
     if denied is not None:
         return denied
+    if not isinstance(data, dict):
+        return JSONResponse(
+            {'success': False, 'message': 'Invalid request'}, status_code=400)
+
+    required_fields = ('sn', 'resolution', 'mode', 'thread', 'classify', 'danmu')
+    missing_fields = [field for field in required_fields if field not in data]
+    if missing_fields:
+        return JSONResponse({
+            'success': False,
+            'message': 'Missing fields: ' + ', '.join(missing_fields),
+        }, status_code=400)
+
+    raw_sn = data.get('sn')
+    if (isinstance(raw_sn, bool) or not isinstance(raw_sn, (str, int))
+            or not str(raw_sn).strip()):
+        return JSONResponse(
+            {'success': False, 'message': 'Invalid sn'}, status_code=400)
+
     settings = Config.read_settings()
 
     # 下载清晰度
@@ -2663,10 +2690,21 @@ def _manual_task_blocking(request, data):
         mode = data['mode']
 
     # 下载线程数
-    if data['thread']:
-        thread = int(data['thread'])
-    else:
-        thread = 1
+    raw_thread = data['thread']
+    if isinstance(raw_thread, bool):
+        return JSONResponse(
+            {'success': False, 'message': 'Invalid thread'}, status_code=400)
+    if isinstance(raw_thread, float) and not raw_thread.is_integer():
+        return JSONResponse(
+            {'success': False, 'message': 'Invalid thread'}, status_code=400)
+    try:
+        thread = int(raw_thread)
+    except (TypeError, ValueError, OverflowError):
+        return JSONResponse(
+            {'success': False, 'message': 'Invalid thread'}, status_code=400)
+    if thread < 1:
+        return JSONResponse(
+            {'success': False, 'message': 'Invalid thread'}, status_code=400)
     if thread > Config.get_max_multi_thread():
         # 是否超过最大允许线程数
         thread_limit = Config.get_max_multi_thread()
@@ -2674,8 +2712,9 @@ def _manual_task_blocking(request, data):
         thread_limit = thread
 
     def run_cui():
-        cui(data['sn'], resolution, mode, thread_limit, [], classify=data['classify'], realtime_show=False,
-            cui_danmu=data['danmu'])
+        cui(str(raw_sn).strip(), resolution, mode, thread_limit, [],
+            classify=bool(data['classify']), realtime_show=False,
+            cui_danmu=bool(data['danmu']))
 
     server = threading.Thread(target=run_cui)
     err_print(0, 'Dashboard', '通過 Web 控制臺下達了手動任務', no_sn=True, status=2)

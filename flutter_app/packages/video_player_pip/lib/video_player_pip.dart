@@ -14,7 +14,8 @@ import 'video_player_pip_platform_interface.dart';
 class VideoPlayerPip {
   static const MethodChannel _channel = MethodChannel('video_player_pip');
 
-  static VideoPlayerPipPlatform get _platform => VideoPlayerPipPlatform.instance;
+  static VideoPlayerPipPlatform get _platform =>
+      VideoPlayerPipPlatform.instance;
 
   /// 只有手機有系統的子母畫面. 測試裡可以直接改.
   static bool supported = !kIsWeb && (Platform.isAndroid || Platform.isIOS);
@@ -26,6 +27,7 @@ class VideoPlayerPip {
   /// For Android, this requires API level 26 (Android 8.0) or higher.
   /// For iOS, this requires iOS 14.0 or higher.
   static Future<bool> isPipSupported() {
+    if (!supported) return Future.value(false);
     return _platform.isPipSupported();
   }
 
@@ -55,6 +57,7 @@ class VideoPlayerPip {
     int? width,
     int? height,
   }) {
+    if (!supported) return Future.value(false);
     // ignore: invalid_use_of_visible_for_testing_member
     if (controller.textureId == VideoPlayerController.kUninitializedTextureId) {
       debugPrint(
@@ -76,6 +79,7 @@ class VideoPlayerPip {
   ///
   /// Returns `true` if PiP mode was exited successfully, or `false` otherwise.
   static Future<bool> exitPipMode() {
+    if (!supported) return Future.value(false);
     return _platform.exitPipMode();
   }
 

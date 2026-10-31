@@ -124,7 +124,7 @@
         }
     } else {
         CGColorSpaceRef colorSpace = CGImageGetColorSpace(cgImage);
-        if (CGColorSpaceGetModel(colorSpace) != kCGColorSpaceModelRGB) {
+        if (colorSpace == NULL || CGColorSpaceGetModel(colorSpace) != kCGColorSpaceModelRGB) {
             CGImageRelease(cgImage);
             return nil;
         }
@@ -132,8 +132,16 @@
         CGBitmapInfo binfo = CGImageGetBitmapInfo( cgImage );
         
         CGDataProviderRef dataProvider = CGImageGetDataProvider(cgImage);
+        if (dataProvider == NULL) {
+            CGImageRelease(cgImage);
+            return nil;
+        }
         CFDataRef imageData = CGDataProviderCopyData(dataProvider);
-        UInt8 *rawData = ( UInt8 * ) CFDataGetBytePtr(imageData);
+        if (imageData == NULL) {
+            CGImageRelease(cgImage);
+            return nil;
+        }
+        const UInt8 *rawData = CFDataGetBytePtr(imageData);
         
         int width = ( int ) CGImageGetWidth(cgImage);
         int height = ( int ) CGImageGetHeight(cgImage);
@@ -141,7 +149,9 @@
         size_t ret_size = 0;
         uint8_t *output = NULL;
         
-        // preprocess the data for libwebp
+        // preprocess the data for libwebp. CFDataGetBytePtr returns a pointer
+        // into immutable data; make a mutable copy before the simulator-only
+        // byte-order conversion below.
         if( ainfo == kCGImageAlphaPremultipliedFirst || ainfo == kCGImageAlphaNoneSkipFirst ) {
             if( ( binfo & kCGBitmapByteOrderMask ) == kCGBitmapByteOrder32Little ) {
                 // Little-endian ( iPhone )
@@ -152,6 +162,13 @@
             } else 
                 if( ( binfo & kCGBitmapByteOrderMask ) == kCGBitmapByteOrder32Big ) {
                     // Big-endian ( iPhone Simulator )
+                    CFMutableDataRef mutableImageData = CFDataCreateMutableCopy(NULL, 0, imageData);
+                    if (mutableImageData == NULL) {
+                        CFRelease(imageData);
+                        CGImageRelease(cgImage);
+                        return nil;
+                    }
+                    rawData = CFDataGetMutableBytePtr(mutableImageData);
                     for(int y = 0;y<height;y++) {
                         uint32_t *p = ( uint32_t * ) ( ( (uint8_t * ) (rawData + y*stride) ) );
                         for(int x = 0; x<width;x++,p++) {
@@ -163,19 +180,21 @@
                         ret_size = WebPEncodeLosslessRGBA(rawData, width, height, stride, &output);
                     else
                         ret_size = WebPEncodeRGBA(rawData, width, height, stride, (float)quality, &output);
+                    CFRelease(mutableImageData);
                 }
         }
         else {
             NSLog(@"Sorry, don't support this CGImageAlphaInfo: %d", (int) binfo );
         }
-        CGDataProviderRelease(dataProvider);
         CFRelease(imageData);
-        CGColorSpaceRelease(colorSpace);
+        CGImageRelease(cgImage);
         
         if (ret_size == 0) {
+            if (output != NULL) WebPFree(output);
             return nil;
         }
         NSData *data = [NSData dataWithBytes:(const void *)output length:ret_size];
+        WebPFree(output);
         return( data );
     }
 }

@@ -447,7 +447,8 @@ class _WatchPageState extends State<WatchPage> with WidgetsBindingObserver {
 
   IntroSkip? get _effectiveIntro => switch (prefs.openingSkipMode) {
         'off' => null,
-        'aniskip-only' => _aniskipIntro?.source == 'AniSkip' ? _aniskipIntro : null,
+        'aniskip-only' =>
+          _aniskipIntro?.source == 'AniSkip' ? _aniskipIntro : null,
         'danmaku-only' => _danmakuIntro,
         'danmaku-first' => _danmakuIntro ?? _aniskipIntro,
         _ => _aniskipIntro ?? _danmakuIntro,
@@ -699,6 +700,7 @@ class _WatchPageState extends State<WatchPage> with WidgetsBindingObserver {
     // 離開播放頁就把進度落盤, 不要留著那一秒的 debounce 在後面等 —— 使用者
     // 退出去之後馬上把 app 滑掉的話, 那一秒就是進度不見的那一秒.
     unawaited(state.flushWatchTimesToDisk());
+    unawaited(state.flushWatchNames());
     // 播放中那幾筆進度是悄悄記的, 回到的那一頁 (繼續觀看、觀看紀錄) 這時候
     // 才要看到最新的. 不能在 dispose 裡當場通知 —— 這時候整棵樹是鎖著的.
     scheduleMicrotask(state.watchTimesChanged);
@@ -818,7 +820,9 @@ class _WatchPageState extends State<WatchPage> with WidgetsBindingObserver {
       if (controller == null || controller != _controller) return;
       await controller.pause();
       if (!mounted) return;
-      await _syncTime(force: true);
+      // 進度落盤/上傳可能等待網路。不要讓它卡住生命週期佇列，否則
+      // resumed 事件會一直排在這個 Future 後面，播放器會多停一個 frame。
+      unawaited(_syncTime(force: true).catchError((Object _) {}));
       await WakelockPlus.disable();
     }).catchError((Object _) {});
   }
@@ -992,7 +996,9 @@ class _WatchPageState extends State<WatchPage> with WidgetsBindingObserver {
 
   /// 建立 / 換掉 VideoPlayerController
   Future<void> _openSource(
-      {double? seekTo, bool autoplay = true, bool releaseDecoder = false}) async {
+      {double? seekTo,
+      bool autoplay = true,
+      bool releaseDecoder = false}) async {
     _cancelOpeningPrefetch();
     if (_castSupported && cast.connected) {
       await _openOnChromecast(seekTo: seekTo, autoplay: autoplay);
@@ -1077,7 +1083,8 @@ class _WatchPageState extends State<WatchPage> with WidgetsBindingObserver {
           viewType: viewType);
     } else if (_streaming) {
       final direct = client.hlsPlaylistUrl(_sn, castTicket: ticket);
-      final cached = airplay ? direct
+      final cached = airplay
+          ? direct
           : await _cachedHlsUrl(direct, 'h$_sn-$_streamPlaylistId');
       usedCache = cached != direct;
       controller = VideoPlayerController.networkUrl(
@@ -1318,8 +1325,7 @@ class _WatchPageState extends State<WatchPage> with WidgetsBindingObserver {
           resolution: res > 0 ? res : null, castTicket: ticket);
       type = 'video/mp4';
     } else {
-      throw const _CastUnavailable(
-          '這一集只存在這支手機上，伺服器的片庫裡沒有，電視抓不到。停止投放就能在手機上看。');
+      throw const _CastUnavailable('這一集只存在這支手機上，伺服器的片庫裡沒有，電視抓不到。停止投放就能在手機上看。');
     }
     final cover = _series?.cover ?? '';
     final duration = _playableDuration;
@@ -1372,10 +1378,10 @@ class _WatchPageState extends State<WatchPage> with WidgetsBindingObserver {
     final media = cast.media;
     if (media == null || media.sn != _sn) return;
     final playback = cast.playback;
-    final playing = playback == CastPlayback.playing ||
-        playback == CastPlayback.buffering;
-    final buffering = playback == CastPlayback.buffering ||
-        playback == CastPlayback.loading;
+    final playing =
+        playback == CastPlayback.playing || playback == CastPlayback.buffering;
+    final buffering =
+        playback == CastPlayback.buffering || playback == CastPlayback.loading;
     final stopped = playback == CastPlayback.idle ||
         playback == CastPlayback.ended ||
         playback == CastPlayback.failed;
@@ -1472,8 +1478,7 @@ class _WatchPageState extends State<WatchPage> with WidgetsBindingObserver {
     setState(() {
       _controller = controller;
       // 架上那個是照 _sourceKey 認的, 而 _sourceKey 裡帶著 AirPlay 的狀態
-      _airplaySource =
-          _airplay.active && (_needsProxy || _localFile == null);
+      _airplaySource = _airplay.active && (_needsProxy || _localFile == null);
       _initialising = false;
       _error = '';
       _duration = duration > 0 ? duration : _duration;
@@ -1626,9 +1631,7 @@ class _WatchPageState extends State<WatchPage> with WidgetsBindingObserver {
       }
       final start = interval.start;
       final end = interval.end;
-      if (start >= 0 &&
-          end > start + 40 &&
-          end < duration - 300) {
+      if (start >= 0 && end > start + 40 && end < duration - 300) {
         setState(() => _aniskipIntro = IntroSkip(start, end, interval.source));
       }
     } catch (_) {
@@ -2218,7 +2221,9 @@ class _WatchPageState extends State<WatchPage> with WidgetsBindingObserver {
     } else if (Device.tv && _playing && _pendingSeek == null) {
       _pauseRefreshTimer?.cancel();
       _pauseRefreshTimer = Timer(kTvPauseRefreshAfter, () {
-        if (mounted && controller == _controller && !controller.value.isPlaying) {
+        if (mounted &&
+            controller == _controller &&
+            !controller.value.isPlaying) {
           _refreshOnResume = true;
         }
       });
@@ -2504,11 +2509,9 @@ class _WatchPageState extends State<WatchPage> with WidgetsBindingObserver {
           }
           final elapsed =
               DateTime.now().difference(startedAt).inMilliseconds / 1000;
-          final advanced = active.value.isPlaying
-              ? elapsed * (_boosting ? 2 : _rate)
-              : 0.0;
-          final atTarget =
-              actual != null &&
+          final advanced =
+              active.value.isPlaying ? elapsed * (_boosting ? 2 : _rate) : 0.0;
+          final atTarget = actual != null &&
               actual.inMilliseconds / 1000 >= wanted - 1.5 &&
               actual.inMilliseconds / 1000 <= wanted + advanced + 1.5;
           // 壞掉的播放器也可能回報「到了」—— 那不算, 要走下面的失敗收尾,
@@ -3942,7 +3945,8 @@ class _WatchPageState extends State<WatchPage> with WidgetsBindingObserver {
                           // 時間跟進度條一秒動十次. 收起來的時候 AnimatedOpacity
                           // 不再是重畫的邊界, 沒有這一層的話那十次會一路往上把
                           // 整個頁面拖去重畫.
-                          child: Device.tv && (!_controlsVisible || _settingsOpen)
+                          child: Device.tv &&
+                                  (!_controlsVisible || _settingsOpen)
                               ? const SizedBox.shrink()
                               : RepaintBoundary(
                                   child: _controls(mobileInline: mobileInline)),
@@ -3985,7 +3989,8 @@ class _WatchPageState extends State<WatchPage> with WidgetsBindingObserver {
                                 _routeIsCurrent &&
                                 !_timelineEditing,
                             onSkip: () {
-                              if (_sn == introEpisode && _effectiveIntro == intro) {
+                              if (_sn == introEpisode &&
+                                  _effectiveIntro == intro) {
                                 _skipOpening(intro);
                               }
                             },
@@ -4183,8 +4188,7 @@ class _WatchPageState extends State<WatchPage> with WidgetsBindingObserver {
         ListenableBuilder(
           listenable: cast,
           builder: (context, _) {
-            if (!cast.available ||
-                (!cast.connected && cast.devices.isEmpty)) {
+            if (!cast.available || (!cast.connected && cast.devices.isEmpty)) {
               return const SizedBox.shrink();
             }
             return _barButton(

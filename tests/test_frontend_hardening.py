@@ -134,3 +134,33 @@ def test_monitor_uses_one_patched_jquery_and_renders_progress_safely(page, serve
     assert page.evaluate('() => layui.$ === window.jQuery && jQuery.fn.jquery') == '3.7.1'
     assert not any('/lay/modules/jquery.js' in url for url in loaded)
     assert page.errors == []
+
+
+def test_userinfo_renders_untrusted_history_as_text(page, server):
+    """History IDs may be supplied by plugins and must not become DOM markup."""
+    template = Path(__file__).resolve().parents[1] / 'Dashboard/templates/userinfo.html'
+
+    def userinfo(route):
+        if route.request.method == 'GET':
+            route.fulfill(content_type='text/html',
+                          body=template.read_text(encoding='utf-8'))
+        else:
+            route.fulfill(json={
+                'status': '200',
+                'username': 'tester',
+                'role': 'user',
+                'videotimes': {
+                    '<img src=x onerror=alert(1)>': {
+                        'time': 3,
+                        'ended': False,
+                    },
+                },
+            })
+
+    page.route('**/userinfo', userinfo)
+    page.goto(server.url + '/userinfo')
+    page.wait_for_selector('#video-times li')
+    expect(page.locator('#video-times li')).to_have_text(
+        '影片 SN: <img src=x onerror=alert(1)>, 時間: 3s, 已結束?: false')
+    assert page.locator('#video-times img').count() == 0
+    assert page.errors == []

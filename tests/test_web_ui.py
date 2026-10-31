@@ -1367,8 +1367,8 @@ def test_tapping_an_episode_that_is_not_on_disk_starts_it_downloading(page, serv
     page.wait_for_url(re.compile(r'/watch\?id=%s&streaming=1' % wanted))
     assert len(MANUAL_TASKS) == 1
     task = MANUAL_TASKS[0]
-    # /manualTask reads all six keys out of the body and KeyErrors on any that
-    # is missing, so the payload shape is the contract.
+    # /manualTask validates all six keys before starting the worker, so the
+    # payload shape remains an explicit part of the dashboard contract.
     assert sorted(task) == ['classify', 'danmu', 'mode', 'resolution', 'sn', 'thread']
     assert task['sn'] == wanted
     assert task['mode'] == 'single'

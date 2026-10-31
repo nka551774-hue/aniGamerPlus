@@ -261,7 +261,10 @@ public class VideoThumbnailPlugin implements FlutterPlugin, MethodCallHandler {
 
     private static void setDataSource(String video, final MediaMetadataRetriever retriever) throws IOException {
         File videoFile = new File(video);
-        FileInputStream inputStream = new FileInputStream(videoFile.getAbsolutePath());
-        retriever.setDataSource(inputStream.getFD());
+        // MediaMetadataRetriever does not take ownership of the descriptor; the
+        // Android API explicitly allows closing it as soon as setDataSource returns.
+        try (FileInputStream inputStream = new FileInputStream(videoFile.getAbsolutePath())) {
+            retriever.setDataSource(inputStream.getFD());
+        }
     }
 }

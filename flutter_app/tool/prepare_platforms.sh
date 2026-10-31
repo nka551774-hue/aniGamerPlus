@@ -91,7 +91,13 @@ def patch_manifest(path):
                      'android.permission.READ_MEDIA_IMAGES',
                      'android.permission.READ_MEDIA_VIDEO',
                      'android.permission.READ_MEDIA_AUDIO'):
-        if unwanted in permissions:
+        nodes = [node for node in manifest.findall('uses-permission')
+                 if node.get(attr('name')) == unwanted]
+        if nodes:
+            # 即使樣板自己已經帶了權限, 也要標記成 remove. 否則
+            # open_filex 的 manifest 合併後仍會把它帶進最終 APK.
+            for node in nodes:
+                node.set('{%s}node' % TOOLS, 'remove')
             continue
         node = ET.Element('uses-permission')
         node.set(attr('name'), unwanted)

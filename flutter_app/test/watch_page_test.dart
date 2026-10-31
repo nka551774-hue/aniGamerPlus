@@ -144,7 +144,8 @@ class DelayedPlayer extends VideoPlayerPlatform {
     scheduleMicrotask(() {
       if (stream.isClosed) return;
       if (failInitialisation) {
-        stream.addError(PlatformException(code: 'VideoError', message: 'fixture'));
+        stream.addError(
+            PlatformException(code: 'VideoError', message: 'fixture'));
         return;
       }
       stream.add(VideoEvent(
@@ -170,7 +171,8 @@ class DelayedPlayer extends VideoPlayerPlatform {
   @override
   Future<void> play(int id) async {
     playing = true;
-    if (seekWaitsForPlay && _nativeSeek != null &&
+    if (seekWaitsForPlay &&
+        _nativeSeek != null &&
         (!stallFirstPlayerSeek || id > 1)) {
       actual = _nativeSeek!;
     }
@@ -469,8 +471,8 @@ void main() {
     expect(player.playing, isFalse);
     await tester.pumpWidget(const SizedBox());
     await tester.pump();
-    await tester.runAsync(
-        () => Future<void>.delayed(const Duration(milliseconds: 50)));
+    await tester
+        .runAsync(() => Future<void>.delayed(const Duration(milliseconds: 50)));
     await tester.pump();
     expect(state.watchTimeOf('1')?.ended, isTrue);
     expect(state.downloads.isDownloaded('1'), isTrue);
@@ -845,21 +847,18 @@ void main() {
       player.actual = Duration(milliseconds: position);
       await tester.pump(const Duration(milliseconds: 350));
       expect(player.seeks.where((seek) => seek.inSeconds == 296), isEmpty);
-      expect(find.text('立即跳過 (${position == 206000 ? 3 : 1})'),
-          findsOneWidget);
+      expect(find.text('立即跳過 (${position == 206000 ? 3 : 1})'), findsOneWidget);
     }
     player.actual = const Duration(seconds: 209);
     await tester.pump(const Duration(milliseconds: 350));
     await tester.pump();
-    expect(player.seeks.where((seek) => seek.inSeconds == 296),
-        hasLength(1));
+    expect(player.seeks.where((seek) => seek.inSeconds == 296), hasLength(1));
     player.actual = const Duration(seconds: 296);
     await tester.pump(const Duration(milliseconds: 350));
     expect(find.byKey(const ValueKey('skip-intro')), findsNothing);
     expect(player.playing, isTrue);
     await tester.pump(const Duration(seconds: 3));
-    expect(player.seeks.where((seek) => seek.inSeconds == 296),
-        hasLength(1));
+    expect(player.seeks.where((seek) => seek.inSeconds == 296), hasLength(1));
     await tester.pumpWidget(const SizedBox());
   });
 
@@ -1183,8 +1182,7 @@ void main() {
     await tester.pump(const Duration(milliseconds: 100));
     await tester.pump(const Duration(seconds: 2));
     expect(tester.widget<Slider>(find.byType(Slider)).value, 300);
-    expect(player.playing, true,
-        reason: '先允許原生輸出, 但舊位置仍不可覆蓋等待中的目標');
+    expect(player.playing, true, reason: '先允許原生輸出, 但舊位置仍不可覆蓋等待中的目標');
     seek(tester, 420);
     await tester.pump(const Duration(milliseconds: 150));
     await tester.pump(const Duration(milliseconds: 150));
@@ -1930,8 +1928,7 @@ void main() {
     // 從觀看紀錄接著看: 開起來先跳到上次的位置. 那裡還沒載過, 播放器一定在
     // 緩衝 —— 以前還要再等「緩衝完」(最多 1.2 秒) 才肯按播放, 每一次續播的
     // 開頭都白白多等那一段.
-    state.noteWatchTime(
-        '1', WatchTime(time: 300, duration: 600, timestamp: 1));
+    state.noteWatchTime('1', WatchTime(time: 300, duration: 600, timestamp: 1));
     player.actual = const Duration(seconds: 300);
     player.bufferOnSeek = true;
     await open(tester);
@@ -1988,14 +1985,13 @@ void main() {
     await tester.pump(const Duration(seconds: 2));
   });
 
-  testWidgets('播到一半原生播放器報錯: 從同一個位置自己重開, 一直壞才放棄',
-      (tester) async {
+  testWidgets('播到一半原生播放器報錯: 從同一個位置自己重開, 一直壞才放棄', (tester) async {
     await open(tester);
     final creations = player.creations;
 
     Future<void> fail() async {
-      player.latest.addError(
-          PlatformException(code: 'VideoError', message: '連線中斷'));
+      player.latest
+          .addError(PlatformException(code: 'VideoError', message: '連線中斷'));
       for (var i = 0; i < 10; i++) {
         await tester.pump(const Duration(milliseconds: 100));
       }
@@ -2054,8 +2050,7 @@ void main() {
 
     final saved = state.watchTimeOf('1');
     expect(saved, isNotNull, reason: '離開時一定要留下一筆');
-    expect(saved!.time, greaterThanOrEqualTo(3),
-        reason: '最後那幾秒不該因為十秒閘而消失');
+    expect(saved!.time, greaterThanOrEqualTo(3), reason: '最後那幾秒不該因為十秒閘而消失');
   });
 
   testWidgets('每一集自己算自己的十秒窗, 換集不會吃掉新一集的開頭', (tester) async {
@@ -2186,8 +2181,7 @@ void main() {
       await tester.pump(const Duration(milliseconds: 300));
     }
 
-    testWidgets('播放中掛上自動子母畫面, 暫停就拆掉, 離開播放頁全部收掉',
-        (tester) async {
+    testWidgets('播放中掛上自動子母畫面, 暫停就拆掉, 離開播放頁全部收掉', (tester) async {
       installNative(tester);
       await open(tester);
       expect(player.playing, isTrue);
@@ -2203,8 +2197,7 @@ void main() {
       await togglePlay(tester);
       expect(player.playing, isFalse);
       expect(updates.last['autoEnter'], isFalse);
-      expect(updates.last['playing'], isFalse,
-          reason: '子母畫面視窗裡要改畫播放鍵');
+      expect(updates.last['playing'], isFalse, reason: '子母畫面視窗裡要改畫播放鍵');
 
       await tester.pumpWidget(const SizedBox());
       expect(updates.last['autoEnter'], isFalse);
@@ -2234,8 +2227,7 @@ void main() {
       await tester.pumpWidget(const SizedBox());
     });
 
-    testWidgets('事件比切到背景晚到也認得: 問一次原生是不是已經在子母畫面裡',
-        (tester) async {
+    testWidgets('事件比切到背景晚到也認得: 問一次原生是不是已經在子母畫面裡', (tester) async {
       installNative(tester);
       await open(tester);
       nativeInPip = true;
@@ -2245,8 +2237,7 @@ void main() {
       await tester.pumpWidget(const SizedBox());
     });
 
-    testWidgets('自動子母畫面沒開起來 (控制中心、來電): 等一下照常暫停',
-        (tester) async {
+    testWidgets('自動子母畫面沒開起來 (控制中心、來電): 等一下照常暫停', (tester) async {
       installNative(tester);
       await open(tester);
       tester.binding.handleAppLifecycleStateChanged(AppLifecycleState.inactive);
@@ -2354,7 +2345,8 @@ void main() {
             () => Future<void>.delayed(const Duration(milliseconds: 20)));
         await tester.pump();
       }
-      final overlay = tester.widget<DanmakuOverlay>(find.byType(DanmakuOverlay));
+      final overlay =
+          tester.widget<DanmakuOverlay>(find.byType(DanmakuOverlay));
       expect(overlay.comments, isNotEmpty);
       expect(overlay.lowPower, isTrue);
       await tester.pumpWidget(const SizedBox());
@@ -2372,9 +2364,8 @@ void main() {
         tester,
         () => find.byType(DanmakuOverlay).evaluate().isNotEmpty,
       );
-      final comments = tester
-          .widget<DanmakuOverlay>(find.byType(DanmakuOverlay))
-          .comments;
+      final comments =
+          tester.widget<DanmakuOverlay>(find.byType(DanmakuOverlay)).comments;
       await tester.sendKeyEvent(LogicalKeyboardKey.mediaPause);
       await tester.pump();
       expect(player.playing, isFalse);
@@ -2446,8 +2437,7 @@ void main() {
       await tester.pumpWidget(const SizedBox());
     });
 
-    testWidgets('長暫停後先跳轉再播放, 重建保留新目標而非 native 舊位置',
-        (tester) async {
+    testWidgets('長暫停後先跳轉再播放, 重建保留新目標而非 native 舊位置', (tester) async {
       await open(tester);
       player.seekWaitsForPlay = true;
       await tester.sendKeyEvent(LogicalKeyboardKey.mediaPause);

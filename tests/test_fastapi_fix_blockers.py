@@ -144,6 +144,66 @@ def test_admin_json_routes_authenticate_before_parsing_body(
     assert calls == 0
 
 
+def _manual_task_payload(**overrides):
+    payload = {
+        'sn': '123',
+        'resolution': '720',
+        'mode': 'single',
+        'thread': 1,
+        'classify': True,
+        'danmu': False,
+    }
+    payload.update(overrides)
+    return payload
+
+
+@pytest.mark.parametrize('body', [b'{', b'not-json'])
+def test_manual_task_rejects_malformed_json(
+        client, autouse_settings, settings, userdata, body):
+    settings['dashboard']['user_control']['enabled'] = True
+    client.cookies.set('token', 'admintoken123')
+    response = client.post('/manualTask', content=body,
+                           headers={'Content-Type': 'application/json'})
+    assert response.status_code == 400
+    assert response.json()['success'] is False
+
+
+@pytest.mark.parametrize('payload', [[], 'text', 42, None])
+def test_manual_task_rejects_non_object_json(
+        client, autouse_settings, settings, userdata, payload):
+    settings['dashboard']['user_control']['enabled'] = True
+    client.cookies.set('token', 'admintoken123')
+    response = client.post('/manualTask', json=payload)
+    assert response.status_code == 400
+    assert response.json()['success'] is False
+
+
+@pytest.mark.parametrize('missing', [
+    'sn', 'resolution', 'mode', 'thread', 'classify', 'danmu',
+])
+def test_manual_task_rejects_missing_required_field(
+        client, autouse_settings, settings, userdata, missing):
+    settings['dashboard']['user_control']['enabled'] = True
+    client.cookies.set('token', 'admintoken123')
+    payload = _manual_task_payload()
+    payload.pop(missing)
+    response = client.post('/manualTask', json=payload)
+    assert response.status_code == 400
+    assert missing in response.json()['message']
+
+
+@pytest.mark.parametrize(
+    'thread', ['abc', '', None, 0, -1, 1.5, True, {}, '9' * 5000])
+def test_manual_task_rejects_invalid_thread_values(
+        client, autouse_settings, settings, userdata, thread):
+    settings['dashboard']['user_control']['enabled'] = True
+    client.cookies.set('token', 'admintoken123')
+    response = client.post('/manualTask',
+                           json=_manual_task_payload(thread=thread))
+    assert response.status_code == 400
+    assert response.json()['message'] == 'Invalid thread'
+
+
 def test_sn_list_authenticates_before_reading_raw_body(
         client, autouse_settings, settings, userdata, monkeypatch):
     settings['dashboard']['user_control']['enabled'] = True

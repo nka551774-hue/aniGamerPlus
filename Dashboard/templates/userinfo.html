@@ -62,9 +62,16 @@
                         $('#role').text(response.role);
                         const videoTimes = response.videotimes;
                         for (const [sn, info] of Object.entries(videoTimes)) {
-                            $('#video-times').append(
-                                `<li class="list-group-item">影片 SN: ${sn}, 時間: ${info.time}s, 已結束?: ${info.ended}</li>`
+                            // Build a text node instead of interpolating account data
+                            // into HTML.  Episode IDs can come from plugins/user
+                            // history and must never become executable markup.
+                            const item = document.createElement('li');
+                            item.className = 'list-group-item';
+                            item.textContent = (
+                                `影片 SN: ${sn}, 時間: ${info.time}s, ` +
+                                `已結束?: ${info.ended}`
                             );
+                            document.getElementById('video-times').append(item);
                         }
                     } else {
                         alert('無法獲取用戶資訊！');
